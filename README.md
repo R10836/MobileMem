@@ -4,10 +4,12 @@
 
 ### MobileMem: Learning from a Year of Mobile Experiences
 
-[![Paper](https://img.shields.io/badge/📄_Paper-2608.13606v2-b31b1b?style=flat-square&logo=arxiv&logoColor=white)](https://arxiv.org/abs/2608.13606v2)
+[![Technical Report](https://img.shields.io/badge/📄_Technical_Report-2608.13606v2-b31b1b?style=flat-square&logo=arxiv&logoColor=white)](https://arxiv.org/abs/2608.13606v2)
+[![Chinese Report](https://img.shields.io/badge/📄_Chinese_Report-202608.00183V1-ff6f00?style=flat-square&logo=googledocs&logoColor=white)](https://chinaxiv.org/abs/202608.00183V1)
 [![Website](https://img.shields.io/badge/🌐_Website-MobileMem-1e7bbf?style=flat-square&logo=googlechrome&logoColor=white)](https://zjunlp.github.io/MobileMem/)
 [![HuggingFace](https://img.shields.io/badge/🤗_Dataset-MobileMem-fcd022?style=flat-square)](https://huggingface.co/datasets/zjunlp/MobileMem)
 [![License](https://img.shields.io/badge/📜_License-MIT-2ea44f?style=flat-square&logo=opensourceinitiative&logoColor=white)](#license)
+
 
 ---
 
