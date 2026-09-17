@@ -121,7 +121,7 @@ We recommend using **[MemTrace](https://github.com/zjunlp/MemTrace)** to perform
 If this work or datasets is helpful, please kindly cite as this:
 
 ```bibtex
-@misc{mobilemem,
+@techreport{mobilemem,
       title={MobileMem: Learning from a Year of Mobile Experiences}, 
       author={Xinle Deng and Yida Xue and Xiangyuan Ru and Yijun Chen and Buqiang Xu and Mingjun Mao and Xinjie Liu and Haoming Xu and Shuofei Qiao and Mengru Wang and Chen Jiang and Yuchen Eleanor Jiang and Lizhong Wang and Jason Wang and Li Zeng and Haofen Wang and Guilin Qi and Huajun Chen and Ningyu Zhang},
       year={2026},
