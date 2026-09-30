@@ -24,19 +24,22 @@
 
 ## 📑 Table of Contents
 
+- [📑 Table of Contents](#-table-of-contents)
 - [🔥 News](#-news)
 - [🎯 Applications](#-applications)
 - [📊 Dataset Structure](#-dataset-structure)
+- [🗂️ Project Structure](#️-project-structure)
 - [🚀 Getting Started](#-getting-started)
   - [📖 Text Track](#-text-track)
   - [🖼️ Omni Track](#️-omni-track)
-- [🗂️ Project Structure](#️-project-structure)
+  - [🧩 Struct Track](#-struct-track)
 - [🔍 Analyzing Failures with MemTrace](#-analyzing-failures-with-memtrace)
 - [🚩 Citation](#-citation)
 
 ---
 
 ## 🔥 News
+- **2026-09-30** — We released a structured Chinese version of the dataset and benchmark.
 - **2026-08-18** — We have officially released our [technical report](https://arxiv.org/abs/2608.13606v2).
 - **2026-08-01** — We publicly release the MobileMem dataset.
 - **2026-05-16** — We launch the English version of the dataset and benchmark.
@@ -55,20 +58,48 @@ MobileMem is built from **multiple heterogeneous sources** to enable comprehensi
 
 ## 📊 Dataset Structure
 
-MobileMem contains two complementary splits:
+MobileMem contains three complementary tracks:
 
-| Split | Modality | Description |
+| Track | Modality | Description |
 | :--- | :--- | :--- |
 | **text** | Text | Long-horizon user–assistant conversations and structured mobile-app events for evaluating textual memory systems. |
 | **omni** | Text and images | Multimodal mobile interactions with screenshots and photos. |
+| **struct** | Structured data | Simulated structured data from on-device applications. |
 
 The dataset is available for download at [HuggingFace](https://huggingface.co/datasets/zjunlp/MobileMem).
 
 ---
 
+## 🗂️ Project Structure
+
+The repository is organized into three main tracks. Track-specific details remain in each subdirectory.
+
+```bash
+MobileMem/
+│
+├── text/                           # 📖 Text Track
+│   ├── README.md                   # Track-specific guide and dataset download
+│   ├── keme/                       # 🛠️ KEME synthesis pipeline code
+│   └── eval/                       # ⚙️ Evaluation scripts for text track
+│
+├── omni/                           # 🖼️ Omni Track
+│   ├── README.md                   # Track-specific guide and dataset download
+│   ├── src/                        # 🛠️ Data construction pipeline code
+│   └── eval/                       # ⚙️ Evaluation scripts for omni track
+│
+├── struct/                         # 🧩 Struct Track
+│   ├── README.md                   # Track-specific guide and dataset download
+│   ├── construct/                  # 🛠️ Example generation and review (optional)
+│   └── eval/                       # ⚙️ Evaluation for struct track
+│
+└── README.md                       # This file
+```
+
+---
+
 ## 🚀 Getting Started
 
-MobileMem offers two benchmark tracks. Choose the path that fits your needs and navigate to the corresponding resources.
+MobileMem offers three benchmark tracks. Choose the path that fits your needs and navigate to the corresponding resources.
 
 For an interactive visualization of the MobileMem data, visit the [Dataset Explorer](https://github.com/zjunlp/MobileMem/tree/Dataset-Explorer) branch.
 
@@ -90,28 +121,19 @@ The multimodal benchmark for evaluating on-device memory with realistic mobile i
 | **⚙️ How to Evaluate** | **Detailed evaluation guide for reproducing leaderboard results is available in the [MemBase](https://github.com/zjunlp/MemBase/tree/main/examples/evaluate_memory_systems_on_mobilemem_omni) repository.** | [Link](https://github.com/zjunlp/MemBase/tree/main/examples/evaluate_memory_systems_on_mobilemem_omni) |
 | **🛠️ Data Construction** | Rebuild the entire MobileMem-Omni dataset with the provided pipeline. | [Link](https://github.com/zjunlp/MobileMem/tree/main/omni) |
 
----
+### 🧩 Struct Track
+Simulated structured data from on-device applications.
 
-## 🗂️ Project Structure
-
-The repository is organized into two main tracks, each containing everything you need for data access, evaluation, and construction.
-
-```bash
-MobileMem/
-├── text/                           # 📖 Text Track
-│   ├── README.md                   # Track-specific guide and dataset download
-│   ├── keme/                       # 🛠️ KEME synthesis pipeline code
-│   └── eval/                       # ⚙️ Evaluation scripts for text track
-├── omni/                           # 🖼️ Omni Track
-│   ├── README.md                   # Track-specific guide and dataset download
-│   ├── src/                        # 🛠️ Data construction pipeline code
-│   ├── eval/                       # ⚙️ Evaluation scripts for omni track
-└── README.md                       # This file
-```
+| Section | Description | Quick Link |
+| :--- | :--- | :--- |
+| **📥 Data Access** | Download Struct cases and structured app records from HuggingFace. | [Link](https://huggingface.co/datasets/zjunlp/MobileMem) |
+| **⚙️ How to Evaluate** | Evaluate agent JSONL traces against Struct cases. | [Link](https://github.com/zjunlp/MobileMem/tree/main/struct) |
+| **🛠️ Data Construction** | Example generation and review Skills. | [Link](https://github.com/zjunlp/MobileMem/tree/main/struct/construct) |
 
 ---
 
 ## 🔍 Analyzing Failures with MemTrace
+
 We recommend using **[MemTrace](https://github.com/zjunlp/MemTrace)** to perform an in-depth error analysis. MemTrace helps you visualize and diagnose where and why your memory system fails, making it easier to pinpoint areas for improvement. For an example of how to use MemTrace, please refer to the [tutorial](https://github.com/zjunlp/MemBase/tree/main/examples/trace_memory_lifecycle_with_membase) in MemBase.
 
 ---

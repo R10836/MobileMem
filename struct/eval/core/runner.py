@@ -1,0 +1,1839 @@
+"""Orchestrate single-case, batch, and dry-run evaluation."""
+
+from __future__ import annotations
+
+import copy
+import hashlib
+import json
+import sys
+from collections import defaultdict
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Union
+
+from loguru import logger
+
+from eval.judging.evaluator import run_judge
+from eval.traces.jsonl import ConversationTurn, ParsedSession
+from eval import config
+from eval.core.tasks import (
+    TaskItem,
+    load_tasks_document,
+    match_task_to_session,
+)
+from eval.metrics.tool_efficiency import compute_tool_efficiency
+from eval.metrics.tool_effectiveness import compute_tool_use_effectiveness
+from eval.metrics.answer_information import compute_answer_information_metrics
+from eval.evidence.recall import (
+    compute_evidence_recall,
+    resolve_benchmark_data_root,
+    resolve_index_user_id,
+)
+from eval.evidence.catalog import (
+    EvidencePreflightError,
+    is_active_evidence_root,
+    load_active_evidence_index,
+    validate_tasks_against_index,
+)
+from eval.traces.resolver import (
+    load_parsed_session_resolved,
+    resolve_log_target_prefer_bases,
+)
+from eval.core.capabilities import primary_judge_dict
+
+
+def _format_batch_task_progress(
+    index: int,
+    total: int,
+    task_id: str,
+    row: Dict[str, Any],
+) -> str:
+    if row.get("skipped") is True:
+        errors = row.get("errors") or []
+        detail = str(errors[0]) if errors else str(row.get("match_status") or "unknown reason")
+        if len(detail) > 60:
+            detail = detail[:57] + "..."
+        return f"[{index}/{total}] {task_id} skipped | {detail}"
+    score = row.get("total_score_0_100")
+    if score is None:
+        return f"[{index}/{total}] {task_id} completed"
+    result = "passed" if row.get("passed") is True else "failed"
+    return f"[{index}/{total}] {task_id} completed | {float(score):.2f} | {result}"
+
+
+def _print_batch_progress(message: str) -> None:
+    print(message, file=sys.stderr, flush=True)
+
+
+def _log_bases_for_tasks_file(
+    tasks_path: Path, loaded_format: str, log_base_dir: Optional[Path]
+) -> List[Path]:
+    del loaded_format
+    if log_base_dir is not None:
+        return [log_base_dir.resolve()]
+    return [tasks_path.resolve().parent, Path.cwd()]
+
+
+def _session_getter_for_bases(bases: List[Path]):
+    session_cache: Dict[str, ParsedSession] = {}
+
+    def resolve_spec(spec: str) -> Path:
+        p, _ = resolve_log_target_prefer_bases(bases, spec)
+        return p
+
+    def get_session(spec: str) -> ParsedSession:
+        p = resolve_spec(spec)
+        key = str(p)
+        if key not in session_cache:
+            sess = load_parsed_session_resolved(p)
+            session_cache[key] = sess
+            n_all = len(sess.turns)
+            n_biz = len(sess.business_turns())
+            logger.info(
+                "Trace parsed path={} spec={!r} session_id={} all_turns={} "
+                "business_turns={} source_jsonl_files={}",
+                p,
+                spec,
+                sess.session_id,
+                n_all,
+                n_biz,
+                len(sess.source_paths or []),
+            )
+        else:
+            logger.debug("Reusing loaded session: {}", key)
+        return session_cache[key]
+
+    return get_session, resolve_spec
+
+
+_TASK_EVAL_FINGERPRINT_VERSION = "v2"
+_LOG_CONTENT_FINGERPRINT_VERSION = "v1"
+
+
+def _normalized_optional_text(value: Any) -> Optional[str]:
+    text = str(value or "").strip()
+    return text or None
+
+
+def _normalized_id_list(values: Optional[List[str]]) -> List[str]:
+    return [str(value).strip().lower() for value in (values or []) if str(value).strip()]
+
+
+def task_eval_fingerprint(task: TaskItem) -> str:
+    """Hash every task field that can change matching, judging, or metrics."""
+    prompt = str(task.prompt or "").strip()
+    if not prompt:
+        return ""
+    payload = {
+        "prompt": prompt,
+        "expected_behavior": str(task.expected_behavior or "").strip(),
+        "grading_criteria": str(task.grading_criteria or "").strip(),
+        "pass_threshold": float(task.pass_threshold),
+        "query_match": task.query_match,
+        "turn_index": task.turn_index,
+        "session_log": _normalized_optional_text(task.session_log),
+        "evidence_ids": _normalized_id_list(task.evidence_ids),
+        "supporting_artifact_ids": _normalized_id_list(task.supporting_artifact_ids),
+        "benchmark_user_id": _normalized_optional_text(task.benchmark_user_id),
+        "metadata_gt": str(task.metadata_gt or "").strip(),
+    }
+    encoded = json.dumps(
+        payload,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    digest = hashlib.sha256(encoded).hexdigest()[:16]
+    return f"{_TASK_EVAL_FINGERPRINT_VERSION}:{digest}"
+
+
+def log_content_fingerprint(source_paths: Optional[List[str]]) -> str:
+    """Hash the exact trace files used to build a parsed session."""
+    paths = sorted(
+        {Path(value).expanduser().resolve() for value in (source_paths or [])},
+        key=lambda path: str(path),
+    )
+    digest = hashlib.sha256()
+    for path in paths:
+        path_bytes = str(path).encode("utf-8")
+        content = path.read_bytes()
+        digest.update(len(path_bytes).to_bytes(8, "big"))
+        digest.update(path_bytes)
+        digest.update(len(content).to_bytes(8, "big"))
+        digest.update(content)
+    return f"{_LOG_CONTENT_FINGERPRINT_VERSION}:{digest.hexdigest()}"
+
+
+def row_eval_fingerprint(row: Dict[str, Any]) -> str:
+    """Return only current-version fingerprints; legacy prompt hashes expire."""
+    stored = row.get("task_eval_fingerprint")
+    if isinstance(stored, str):
+        value = stored.strip()
+        if value.startswith(f"{_TASK_EVAL_FINGERPRINT_VERSION}:"):
+            return value
+    return ""
+
+
+def row_eval_content_matches_task(row: Dict[str, Any], task: TaskItem) -> bool:
+    if not row_eval_fingerprint(row):
+        return False
+    return row_eval_fingerprint(row) == task_eval_fingerprint(task)
+
+
+def _merge_checkpoint_row_with_task(row: Dict[str, Any], task: TaskItem) -> Dict[str, Any]:
+    """Preserve evaluation results while refreshing current task metadata."""
+    out = copy.deepcopy(row)
+    out.update(task_fields_public(task))
+    return out
+
+
+def task_fields_public(task: TaskItem) -> Dict[str, Any]:
+    row: Dict[str, Any] = {
+        "task_id": task.task_id,
+        "name": task.name,
+        "capability": task.capability,
+        "sub_capability": task.sub_capability,
+        "dimension": task.dimension,
+        "query_type": task.query_type,
+        "data_sources": task.data_sources,
+        "prompt": task.prompt,
+        "expected_behavior": task.expected_behavior,
+        "grading_criteria": task.grading_criteria,
+        "task_eval_fingerprint": task_eval_fingerprint(task),
+    }
+    gt = str(task.metadata_gt or "").strip()
+    if gt:
+        row["metadata_gt"] = gt
+    return row
+
+
+def _resolve_log_spec(
+    doc_log: Optional[str],
+    log_override: Optional[str],
+    tasks_path: Path,
+    *,
+    loaded_format: str,
+) -> str:
+    del loaded_format
+    spec = log_override or doc_log
+    if not spec:
+        raise ValueError(f"No agent trace was provided for {tasks_path}; use --log")
+    return spec
+
+
+def _active_evidence_preflight(
+    tasks: List[TaskItem],
+    evidence_root: Optional[Path],
+    *,
+    strict: bool = True,
+) -> Optional[Dict[str, Any]]:
+    """Validate cases once before matching traces or invoking a Judge."""
+    if evidence_root is None:
+        return None
+    root = Path(evidence_root).expanduser().resolve()
+    if not is_active_evidence_root(root):
+        return None
+    index = load_active_evidence_index(root)
+    report = validate_tasks_against_index(tasks, index, evidence_root=root)
+    if strict and not report.ok:
+        raise EvidencePreflightError(report)
+    return report.as_dict()
+
+
+def _active_evidence_root_text(root: Optional[Path]) -> Optional[str]:
+    """Return a report-friendly active evidence root."""
+    if root is None:
+        return None
+    resolved = Path(root).expanduser().resolve()
+    return str(resolved) if is_active_evidence_root(resolved) else None
+
+
+def run_dry_run(
+    tasks_path: Union[str, Path],
+    log_override: Optional[str],
+    *,
+    log_base_dir: Optional[Path] = None,
+    with_evidence_recall: bool = True,
+    benchmark_data_root: Optional[Path] = None,
+    evidence_fuzzy: bool = False,
+    evidence_fuzzy_threshold: float = 0.86,
+    with_answer_information_metrics: bool = False,
+) -> Dict[str, Any]:
+    tasks_path = Path(tasks_path)
+    loaded = load_tasks_document(tasks_path)
+    logger.info(
+        "Loaded {} evaluation tasks (format={})",
+        len(loaded.tasks),
+        loaded.format,
+    )
+    er_root_dr = benchmark_data_root if benchmark_data_root is not None else resolve_benchmark_data_root()
+    # Evidence integrity is independent of whether the optional recall metric
+    # is enabled. Dry-run reports errors; formal commands use strict mode.
+    preflight = _active_evidence_preflight(
+        loaded.tasks, er_root_dr, strict=False
+    )
+    idx_uid_dr = resolve_index_user_id(tasks_path)
+    logger.info(
+        "Evidence recall configuration: benchmark_data_root={} index_user_id={}",
+        str(er_root_dr.resolve()) if er_root_dr else None,
+        idx_uid_dr,
+    )
+    bases = _log_bases_for_tasks_file(tasks_path, loaded.format, log_base_dir)
+    default_spec = _resolve_log_spec(
+        loaded.log_path, log_override, tasks_path, loaded_format=loaded.format
+    )
+    get_session, resolve_spec = _session_getter_for_bases(bases)
+
+    default_target = resolve_spec(default_spec)
+    default_session = get_session(default_spec)
+    logger.info(
+        "dry-run default trace spec={!r} -> {} bases={} | session: "
+        "all_turns={} business_turns={}",
+        default_spec,
+        default_target,
+        [str(b) for b in bases],
+        len(default_session.turns),
+        len(default_session.business_turns()),
+    )
+    logger.info(
+        "dry-run metric flags: evidence_recall={} answer_information_metrics={}",
+        with_evidence_recall,
+        with_answer_information_metrics,
+    )
+
+    rows = []
+    for task in loaded.tasks:
+        spec = task.session_log or default_spec
+        target = resolve_spec(spec)
+        session = get_session(spec)
+        m = match_task_to_session(task, session)
+        logger.debug(
+            "dry-run match task_id={} status={} business_turn_index={}",
+            task.task_id,
+            m.status,
+            m.business_turn_index,
+        )
+        business = session.business_turns()
+        rows.append(
+            {
+                "task_id": m.task.task_id,
+                "status": m.status,
+                "log_spec": spec,
+                "resolved_log_target": str(target),
+                "source_files": session.source_paths or [],
+                "matched_turn_source_log": m.turn.source_log_path if m.turn else None,
+                "session_id": session.session_id,
+                "business_turn_count": len(business),
+                "match_global_turn_index": m.global_turn_index,
+                "match_business_turn_index": m.business_turn_index,
+                "match_turn_index": m.business_turn_index,
+                "prompt_preview": m.task.prompt[:120] + ("…" if len(m.task.prompt) > 120 else ""),
+                "user_turn_preview": (m.turn.user_normalized[:120] + "…")
+                if m.turn and len(m.turn.user_normalized) > 120
+                else (m.turn.user_normalized if m.turn else None),
+                "agent_final_answer": m.turn.final_assistant_text() if m.turn else None,
+                "agent_total_tokens": m.turn.agent_total_tokens() if m.turn else None,
+                "agent_processing_seconds": m.turn.agent_processing_duration_seconds()
+                if m.turn
+                else None,
+                "warnings": m.warnings,
+            }
+        )
+        er_root = benchmark_data_root if benchmark_data_root is not None else resolve_benchmark_data_root()
+        _inject_evidence_recall(
+            rows[-1],
+            task=task,
+            turn=m.turn,
+            tasks_path=tasks_path,
+            with_evidence_recall=with_evidence_recall,
+            benchmark_data_root=er_root,
+            evidence_fuzzy=evidence_fuzzy,
+            evidence_fuzzy_threshold=evidence_fuzzy_threshold,
+        )
+        _inject_answer_information_metrics(
+            rows[-1],
+            task=task,
+            with_answer_information_metrics=with_answer_information_metrics,
+            dry_run=True,
+        )
+    out: Dict[str, Any] = {
+        "tasks_path": str(tasks_path.resolve()),
+        "task_file_format": loaded.format,
+        "evidence_root": _active_evidence_root_text(er_root_dr),
+        "default_log_spec": default_spec,
+        "default_log_target": str(default_target),
+        "default_source_files": default_session.source_paths or [],
+        "default_log_path": str(default_target),
+        "with_answer_information_metrics": with_answer_information_metrics,
+        "matches": rows,
+    }
+    if loaded.load_stats is not None:
+        out["case_load_stats"] = loaded.load_stats
+    if loaded.skipped_empty_prompt:
+        out["skipped_empty_prompt"] = loaded.skipped_empty_prompt
+    if preflight is not None:
+        out["evidence_preflight"] = preflight
+    n_ok = sum(1 for r in rows if r["status"] == "ok")
+    n_skip = sum(1 for r in rows if r["status"] == "skipped")
+    n_err = sum(1 for r in rows if r["status"] == "error")
+    logger.info(
+        "dry-run completed: tasks={} matched={} skipped={} errors={}",
+        len(rows),
+        n_ok,
+        n_skip,
+        n_err,
+    )
+    return out
+
+
+def _extended_metrics_log_fragment(base: Dict[str, Any]) -> str:
+    """Build a one-line debug summary of optional metrics."""
+    chunks: List[str] = []
+    tue = base.get("tool_use_effectiveness")
+    if tue is None:
+        chunks.append("tool_effectiveness=not_computed")
+    elif isinstance(tue, dict):
+        err = tue.get("error")
+        if err:
+            err_s = str(err).replace("\n", " ")
+            suffix = "..." if len(err_s) > 120 else ""
+            chunks.append(f"tool_effectiveness=failed({err_s[:120]}{suffix})")
+        else:
+            ratio = tue.get("effective_tool_ratio")
+            tot = tue.get("tool_call_total")
+            eff = tue.get("tool_call_effective")
+            llm_n = tue.get("llm_judged_count")
+            rule_n = tue.get("rule_invalid_count")
+            chunks.append(
+                f"tool_effectiveness=ratio={ratio} effective={eff}/{tot} "
+                f"rule_invalid={rule_n} llm_judged={llm_n}"
+            )
+    else:
+        chunks.append("tool_effectiveness=?")
+
+    er = base.get("evidence_recall")
+    if not isinstance(er, dict):
+        chunks.append("evidence_recall=-")
+    elif er.get("skipped") or er.get("skip_reason") == "disabled":
+        chunks.append("evidence_recall=disabled")
+    else:
+        rec = er.get("recall")
+        hit = er.get("hit_count")
+        gold = er.get("gold_total")
+        chunks.append(f"evidence_recall=recall={rec} hit={hit}/{gold}")
+
+    aim = base.get("answer_information_metrics")
+    if aim is None or not isinstance(aim, dict):
+        chunks.append("answer_information=disabled")
+    else:
+        err = aim.get("error")
+        sr = aim.get("skip_reason")
+        if err:
+            es = str(err).replace("\n", " ")
+            suffix = "..." if len(es) > 100 else ""
+            chunks.append(f"answer_information=failed({es[:100]}{suffix})")
+        elif sr:
+            chunks.append(f"answer_information=skipped({sr})")
+        else:
+            chunks.append(
+                "answer_information="
+                f"R={aim.get('recall')} P={aim.get('precision')} F1={aim.get('f1')} tp={aim.get('tp')}"
+            )
+    return " | ".join(chunks)
+
+
+def _inject_evidence_recall(
+    base: Dict[str, Any],
+    *,
+    task: TaskItem,
+    turn: Optional[ConversationTurn],
+    tasks_path: Path,
+    with_evidence_recall: bool,
+    benchmark_data_root: Optional[Path],
+    evidence_fuzzy: bool,
+    evidence_fuzzy_threshold: float,
+) -> None:
+    if not with_evidence_recall:
+        n_gold = len(task.evidence_ids or [])
+        base["evidence_recall"] = {
+            "skipped": True,
+            "skip_reason": "disabled",
+            "gold_total": n_gold,
+            "hit_count": 0,
+            "recall": None,
+            "hits": [],
+            "misses": [],
+            "per_evidence": [],
+            "index_user_id": None,
+            "fuzzy": evidence_fuzzy,
+            "fuzzy_threshold": evidence_fuzzy_threshold,
+        }
+        return
+    root = benchmark_data_root if benchmark_data_root is not None else resolve_benchmark_data_root()
+    base["evidence_recall"] = compute_evidence_recall(
+        turn,
+        task,
+        benchmark_data_root=root,
+        tasks_path=tasks_path,
+        fuzzy=evidence_fuzzy,
+        fuzzy_threshold=evidence_fuzzy_threshold,
+    )
+
+
+def _inject_answer_information_metrics(
+    base: Dict[str, Any],
+    *,
+    task: TaskItem,
+    with_answer_information_metrics: bool,
+    agent_answer: Optional[str] = None,
+    dry_run: bool = False,
+) -> None:
+    if not with_answer_information_metrics:
+        return
+    if dry_run:
+        from eval.metrics.answer_information import answer_information_metrics_skipped
+
+        base["answer_information_metrics"] = answer_information_metrics_skipped(
+            skip_reason="dry_run",
+            task_id=task.task_id,
+        )
+        return
+    ag = base.get("agent_final_answer") if agent_answer is None else agent_answer
+    if agent_answer is not None and not str(agent_answer).strip():
+        ag = None
+    base["answer_information_metrics"] = compute_answer_information_metrics(
+        final_answer=task.expected_behavior or "",
+        agent_answer=ag,
+        task_id=task.task_id,
+        user_query=task.prompt or "",
+    )
+
+
+def _eval_one_task(
+    task: TaskItem,
+    session,
+    *,
+    tasks_path: Path,
+    with_efficiency: bool,
+    with_tool_use_effectiveness: bool = False,
+    dry_run: bool,
+    with_evidence_recall: bool = True,
+    benchmark_data_root: Optional[Path] = None,
+    evidence_fuzzy: bool = False,
+    evidence_fuzzy_threshold: float = 0.86,
+    with_answer_information_metrics: bool = False,
+    task_index: Optional[int] = None,
+    task_total: Optional[int] = None,
+) -> Dict[str, Any]:
+    m = match_task_to_session(task, session)
+    logger.debug("Evaluation match task_id={} -> {}", task.task_id, m.status)
+    base: Dict[str, Any] = {
+        **task_fields_public(task),
+        "match_status": m.status,
+        "match_global_turn_index": m.global_turn_index,
+        "match_business_turn_index": m.business_turn_index,
+        "match_turn_index": m.business_turn_index,
+        "matched_turn_source_log": m.turn.source_log_path if m.turn else None,
+        "match_warnings": m.warnings,
+        "errors": [],
+        "agent_final_answer": m.turn.final_assistant_text() if m.turn else None,
+        "agent_total_tokens": m.turn.agent_total_tokens() if m.turn else None,
+        "agent_processing_seconds": m.turn.agent_processing_duration_seconds() if m.turn else None,
+    }
+    if m.status != "ok" or m.turn is None:
+        base["skipped"] = True
+        base["total_score_0_100"] = None
+        base["passed"] = None
+        base["judge"] = None
+        base["tool_efficiency"] = None
+        base["tool_use_effectiveness"] = None
+        logger.warning(
+            "Task skipped task_id={} reason=match_failed status={} warnings={}",
+            task.task_id,
+            m.status,
+            m.warnings,
+        )
+        _inject_evidence_recall(
+            base,
+            task=task,
+            turn=m.turn,
+            tasks_path=tasks_path,
+            with_evidence_recall=with_evidence_recall,
+            benchmark_data_root=benchmark_data_root,
+            evidence_fuzzy=evidence_fuzzy,
+            evidence_fuzzy_threshold=evidence_fuzzy_threshold,
+        )
+        _inject_answer_information_metrics(
+            base,
+            task=task,
+            with_answer_information_metrics=with_answer_information_metrics,
+        )
+        logger.debug(
+            "Evaluation metrics task_id={} match_status={} skipped={} | {}",
+            task.task_id,
+            m.status,
+            base.get("skipped"),
+            _extended_metrics_log_fragment(base),
+        )
+        return base
+
+    if dry_run:
+        base["skipped"] = False
+        base["total_score_0_100"] = None
+        base["passed"] = None
+        base["judge"] = None
+        base["tool_efficiency"] = None
+        base["tool_use_effectiveness"] = None
+        _inject_evidence_recall(
+            base,
+            task=task,
+            turn=m.turn,
+            tasks_path=tasks_path,
+            with_evidence_recall=with_evidence_recall,
+            benchmark_data_root=benchmark_data_root,
+            evidence_fuzzy=evidence_fuzzy,
+            evidence_fuzzy_threshold=evidence_fuzzy_threshold,
+        )
+        _inject_answer_information_metrics(
+            base,
+            task=task,
+            with_answer_information_metrics=with_answer_information_metrics,
+            dry_run=True,
+        )
+        logger.debug(
+            "dry-run metrics task_id={} | {}",
+            task.task_id,
+            _extended_metrics_log_fragment(base),
+        )
+        return base
+
+    if not config.llm_config_ready():
+        logger.warning("Task skipped task_id={} reason=LLM_not_configured", task.task_id)
+        base["errors"].append(
+            "LLM is not configured; set LLM_API_KEY and optionally LLM_BASE_URL and LLM_MODEL"
+        )
+        base["skipped"] = True
+        base["total_score_0_100"] = None
+        base["passed"] = None
+        base["judge"] = None
+        base["tool_efficiency"] = None
+        base["tool_use_effectiveness"] = None
+        _inject_evidence_recall(
+            base,
+            task=task,
+            turn=m.turn,
+            tasks_path=tasks_path,
+            with_evidence_recall=with_evidence_recall,
+            benchmark_data_root=benchmark_data_root,
+            evidence_fuzzy=evidence_fuzzy,
+            evidence_fuzzy_threshold=evidence_fuzzy_threshold,
+        )
+        _inject_answer_information_metrics(
+            base,
+            task=task,
+            with_answer_information_metrics=with_answer_information_metrics,
+        )
+        logger.debug(
+            "Evaluation metrics task_id={} match_status={} skipped={} | {}",
+            task.task_id,
+            m.status,
+            base.get("skipped"),
+            _extended_metrics_log_fragment(base),
+        )
+        return base
+
+    try:
+        ens = run_judge(task, m.turn, pass_threshold=task.pass_threshold)
+    except Exception as e:
+        logger.exception("Judge failed task_id={}", task.task_id)
+        base["errors"].append(str(e))
+        base["skipped"] = True
+        base["total_score_0_100"] = None
+        base["passed"] = None
+        base["judge"] = None
+        base["tool_efficiency"] = None
+        base["tool_use_effectiveness"] = None
+        _inject_evidence_recall(
+            base,
+            task=task,
+            turn=m.turn,
+            tasks_path=tasks_path,
+            with_evidence_recall=with_evidence_recall,
+            benchmark_data_root=benchmark_data_root,
+            evidence_fuzzy=evidence_fuzzy,
+            evidence_fuzzy_threshold=evidence_fuzzy_threshold,
+        )
+        _inject_answer_information_metrics(
+            base,
+            task=task,
+            with_answer_information_metrics=with_answer_information_metrics,
+        )
+        logger.debug(
+            "Evaluation metrics task_id={} match_status={} skipped={} | {}",
+            task.task_id,
+            m.status,
+            base.get("skipped"),
+            _extended_metrics_log_fragment(base),
+        )
+        return base
+
+    if not ens.ok:
+        errs = ens.report.get("failure_errors") or ["All Judge model calls failed"]
+        if isinstance(errs, list):
+            base["errors"].extend(errs)
+        else:
+            base["errors"].append(str(errs))
+        base["skipped"] = True
+        base["total_score_0_100"] = None
+        base["passed"] = None
+        base["judge"] = ens.report
+        base["tool_efficiency"] = None
+        base["tool_use_effectiveness"] = None
+        _inject_evidence_recall(
+            base,
+            task=task,
+            turn=m.turn,
+            tasks_path=tasks_path,
+            with_evidence_recall=with_evidence_recall,
+            benchmark_data_root=benchmark_data_root,
+            evidence_fuzzy=evidence_fuzzy,
+            evidence_fuzzy_threshold=evidence_fuzzy_threshold,
+        )
+        _inject_answer_information_metrics(
+            base,
+            task=task,
+            with_answer_information_metrics=with_answer_information_metrics,
+        )
+        logger.debug(
+            "Evaluation metrics task_id={} match_status={} skipped={} | {}",
+            task.task_id,
+            m.status,
+            base.get("skipped"),
+            _extended_metrics_log_fragment(base),
+        )
+        return base
+
+    mean_score = ens.mean_total_score_0_100
+    agg_passed = ens.aggregate_passed
+    q = mean_score / 100.0
+    eff = compute_tool_efficiency(m.turn, q) if with_efficiency else None
+    tue = None
+    if with_tool_use_effectiveness:
+        try:
+            tue = compute_tool_use_effectiveness(m.turn, task)
+        except Exception as e:
+            logger.warning("tool_effectiveness failed task_id={} err={}", task.task_id, e)
+            tue = {
+                "error": str(e),
+                "effective_tool_ratio": None,
+                "tool_call_total": None,
+                "tool_call_effective": None,
+                "tool_call_evaluations": [],
+            }
+
+    base["skipped"] = False
+    base["total_score_0_100"] = mean_score
+    base["passed"] = agg_passed
+    base["pass_threshold"] = task.pass_threshold
+    base["judge"] = ens.report
+    base["tool_efficiency"] = eff
+    base["tool_use_effectiveness"] = tue
+    _inject_evidence_recall(
+        base,
+        task=task,
+        turn=m.turn,
+        tasks_path=tasks_path,
+        with_evidence_recall=with_evidence_recall,
+        benchmark_data_root=benchmark_data_root,
+        evidence_fuzzy=evidence_fuzzy,
+        evidence_fuzzy_threshold=evidence_fuzzy_threshold,
+    )
+    _inject_answer_information_metrics(
+        base,
+        task=task,
+        with_answer_information_metrics=with_answer_information_metrics,
+    )
+    logger.info(
+        "Task completed{} task_id={} mean_score={} aggregate_passed={}",
+        f" [{task_index}/{task_total}]" if task_index is not None and task_total is not None else "",
+        task.task_id,
+        mean_score,
+        agg_passed,
+    )
+    logger.debug(
+        "Task metrics task_id={} | {}",
+        task.task_id,
+        _extended_metrics_log_fragment(base),
+    )
+    return base
+
+
+def _row_needs_metric_refresh(
+    row: Dict[str, Any],
+    *,
+    with_efficiency: bool,
+    with_tool_use_effectiveness: bool,
+    with_evidence_recall: bool,
+    with_answer_information_metrics: bool,
+) -> bool:
+    """Return whether enabled optional metrics are absent from a checkpoint."""
+    if with_answer_information_metrics and "answer_information_metrics" not in row:
+        return True
+    if with_evidence_recall and "evidence_recall" not in row:
+        return True
+
+    scored_ok = (not row.get("skipped")) and row.get("total_score_0_100") is not None
+    if with_tool_use_effectiveness and scored_ok:
+        tu = row.get("tool_use_effectiveness", "__missing__")
+        if tu is None or tu == "__missing__" or not isinstance(tu, dict):
+            return True
+
+    if with_efficiency and scored_ok:
+        te = row.get("tool_efficiency", "__missing__")
+        if te is None or te == "__missing__" or not isinstance(te, dict):
+            return True
+
+    return False
+
+
+def _row_has_completed_judge(row: Dict[str, Any]) -> bool:
+    """Return whether a checkpoint contains a reusable Judge result."""
+    if row.get("skipped"):
+        return False
+    if row.get("total_score_0_100") is None:
+        return False
+    if primary_judge_dict(row) is not None:
+        return True
+    jb = row.get("judge")
+    return isinstance(jb, dict) and jb.get("mode") == "rule"
+
+
+def _resolve_row_eval_log_spec(row: Dict[str, Any], task: TaskItem, default_spec: str) -> str:
+    """Select the original per-task trace when backfilling metrics."""
+    for cand in (row.get("eval_log_spec"), task.session_log, default_spec):
+        if cand and str(cand).strip():
+            return str(cand).strip()
+    return default_spec
+
+
+def _log_spec_paths_equivalent(spec_a: str, spec_b: str, resolve_spec) -> bool:
+    try:
+        return _normalize_log_path_for_meta(resolve_spec(spec_a)) == _normalize_log_path_for_meta(
+            resolve_spec(spec_b)
+        )
+    except Exception:
+        return str(spec_a).strip() == str(spec_b).strip()
+
+
+def _warn_row_eval_log_spec_vs_default(
+    row: Dict[str, Any],
+    task: TaskItem,
+    default_spec: str,
+    resolve_spec,
+) -> None:
+    """Warn when a row trace differs from ``--log`` without blocking resume."""
+    row_spec = str(row.get("eval_log_spec") or "").strip()
+    if not row_spec:
+        return
+    if _log_spec_paths_equivalent(row_spec, default_spec, resolve_spec):
+        return
+    logger.warning(
+        "Batch checkpoint task_id={} has eval_log_spec={!r}, which differs from --log={!r}; "
+        "optional metrics will use the row trace. To resume the full checkpoint, use the trace "
+        "that created the JSON. Per-task eval_log_spec should normally match top-level "
+        "log_path_spec unless the task defines session_log.",
+        task.task_id,
+        row_spec,
+        default_spec,
+    )
+
+
+def _patch_optional_metrics_on_row(
+    out: Dict[str, Any],
+    task: TaskItem,
+    turn: Optional[ConversationTurn],
+    *,
+    tasks_path: Path,
+    with_efficiency: bool,
+    with_tool_use_effectiveness: bool,
+    dry_run: bool,
+    with_evidence_recall: bool,
+    benchmark_data_root: Optional[Path],
+    evidence_fuzzy: bool,
+    evidence_fuzzy_threshold: float,
+    with_answer_information_metrics: bool,
+) -> None:
+    """Backfill optional metrics without changing Judge results or status."""
+    if dry_run:
+        out["tool_efficiency"] = None
+        out["tool_use_effectiveness"] = None
+        _inject_evidence_recall(
+            out,
+            task=task,
+            turn=turn,
+            tasks_path=tasks_path,
+            with_evidence_recall=with_evidence_recall,
+            benchmark_data_root=benchmark_data_root,
+            evidence_fuzzy=evidence_fuzzy,
+            evidence_fuzzy_threshold=evidence_fuzzy_threshold,
+        )
+        _inject_answer_information_metrics(
+            out,
+            task=task,
+            with_answer_information_metrics=with_answer_information_metrics,
+            agent_answer=out.get("agent_final_answer"),
+        )
+        return
+
+    if out.get("skipped") or out.get("total_score_0_100") is None:
+        if "tool_efficiency" not in out:
+            out["tool_efficiency"] = None
+        if "tool_use_effectiveness" not in out:
+            out["tool_use_effectiveness"] = None
+        _inject_evidence_recall(
+            out,
+            task=task,
+            turn=turn,
+            tasks_path=tasks_path,
+            with_evidence_recall=with_evidence_recall,
+            benchmark_data_root=benchmark_data_root,
+            evidence_fuzzy=evidence_fuzzy,
+            evidence_fuzzy_threshold=evidence_fuzzy_threshold,
+        )
+        _inject_answer_information_metrics(
+            out,
+            task=task,
+            with_answer_information_metrics=with_answer_information_metrics,
+            agent_answer=out.get("agent_final_answer"),
+        )
+        return
+
+    if with_efficiency and turn is not None:
+        q = float(out["total_score_0_100"]) / 100.0
+        out["tool_efficiency"] = compute_tool_efficiency(turn, q)
+    if with_tool_use_effectiveness and turn is not None:
+        try:
+            out["tool_use_effectiveness"] = compute_tool_use_effectiveness(turn, task)
+        except Exception as e:
+            logger.warning(
+                "tool_effectiveness checkpoint backfill failed task_id={} err={}",
+                task.task_id,
+                e,
+            )
+            out["tool_use_effectiveness"] = {
+                "error": str(e),
+                "effective_tool_ratio": None,
+                "tool_call_total": None,
+                "tool_call_effective": None,
+                "tool_call_evaluations": [],
+            }
+
+    _inject_evidence_recall(
+        out,
+        task=task,
+        turn=turn,
+        tasks_path=tasks_path,
+        with_evidence_recall=with_evidence_recall,
+        benchmark_data_root=benchmark_data_root,
+        evidence_fuzzy=evidence_fuzzy,
+        evidence_fuzzy_threshold=evidence_fuzzy_threshold,
+    )
+    _inject_answer_information_metrics(
+        out,
+        task=task,
+        with_answer_information_metrics=with_answer_information_metrics,
+        agent_answer=out.get("agent_final_answer"),
+    )
+
+
+def _refresh_row_optional_metrics(
+    row: Dict[str, Any],
+    task: TaskItem,
+    *,
+    tasks_path: Path,
+    default_spec: str,
+    get_session,
+    resolve_spec,
+    with_efficiency: bool,
+    with_tool_use_effectiveness: bool,
+    dry_run: bool,
+    with_evidence_recall: bool,
+    benchmark_data_root: Optional[Path],
+    evidence_fuzzy: bool,
+    evidence_fuzzy_threshold: float,
+    with_answer_information_metrics: bool,
+) -> Dict[str, Any]:
+    """
+    Backfill new optional metrics without rerunning the Judge.
+    Preserve an existing Judge result even if trace rematching fails. Without
+    a Judge result, rematch failure falls back to full task evaluation.
+    """
+    row = _merge_checkpoint_row_with_task(row, task)
+    spec = _resolve_row_eval_log_spec(row, task, default_spec)
+    _warn_row_eval_log_spec_vs_default(row, task, default_spec, resolve_spec)
+    session = get_session(spec)
+
+    if _row_has_completed_judge(row):
+        out = copy.deepcopy(row)
+        m = match_task_to_session(task, session)
+        turn: Optional[ConversationTurn] = None
+        if m.status == "ok" and m.turn is not None:
+            turn = m.turn
+            out["match_status"] = m.status
+            out["match_global_turn_index"] = m.global_turn_index
+            out["match_business_turn_index"] = m.business_turn_index
+            out["match_turn_index"] = m.business_turn_index
+            out["matched_turn_source_log"] = m.turn.source_log_path
+            out["match_warnings"] = m.warnings
+            out["agent_final_answer"] = m.turn.final_assistant_text()
+            out["agent_total_tokens"] = m.turn.agent_total_tokens()
+            out["agent_processing_seconds"] = m.turn.agent_processing_duration_seconds()
+        else:
+            logger.debug(
+                "Batch checkpoint backfill preserved Judge task_id={} log={!r} rematch={}",
+                task.task_id,
+                spec,
+                m.status,
+            )
+        _patch_optional_metrics_on_row(
+            out,
+            task,
+            turn,
+            tasks_path=tasks_path,
+            with_efficiency=with_efficiency,
+            with_tool_use_effectiveness=with_tool_use_effectiveness,
+            dry_run=dry_run,
+            with_evidence_recall=with_evidence_recall,
+            benchmark_data_root=benchmark_data_root,
+            evidence_fuzzy=evidence_fuzzy,
+            evidence_fuzzy_threshold=evidence_fuzzy_threshold,
+            with_answer_information_metrics=with_answer_information_metrics,
+        )
+        out["eval_log_spec"] = spec
+        out["eval_log_target"] = str(resolve_spec(spec))
+        out["eval_source_files"] = session.source_paths or []
+        logger.info(
+            "Batch checkpoint metrics backfilled with Judge preserved task_id={} | {}",
+            task.task_id,
+            _extended_metrics_log_fragment(out),
+        )
+        return out
+
+    m = match_task_to_session(task, session)
+    if m.status != "ok" or m.turn is None:
+        logger.info(
+            "Batch checkpoint backfill fell back to full evaluation "
+            "task_id={} reason=match_not_ok",
+            task.task_id,
+        )
+        out = _eval_one_task(
+            task,
+            session,
+            tasks_path=tasks_path,
+            with_efficiency=with_efficiency,
+            with_tool_use_effectiveness=with_tool_use_effectiveness,
+            dry_run=dry_run,
+            with_evidence_recall=with_evidence_recall,
+            benchmark_data_root=benchmark_data_root,
+            evidence_fuzzy=evidence_fuzzy,
+            evidence_fuzzy_threshold=evidence_fuzzy_threshold,
+            with_answer_information_metrics=with_answer_information_metrics,
+        )
+        out["eval_log_spec"] = spec
+        out["eval_log_target"] = str(resolve_spec(spec))
+        out["eval_source_files"] = session.source_paths or []
+        return out
+
+    if not row_eval_content_matches_task(row, task):
+        logger.warning(
+            "Batch checkpoint row differs from current case; rerunning task_id={}",
+            task.task_id,
+        )
+        out = _eval_one_task(
+            task,
+            session,
+            tasks_path=tasks_path,
+            with_efficiency=with_efficiency,
+            with_tool_use_effectiveness=with_tool_use_effectiveness,
+            dry_run=dry_run,
+            with_evidence_recall=with_evidence_recall,
+            benchmark_data_root=benchmark_data_root,
+            evidence_fuzzy=evidence_fuzzy,
+            evidence_fuzzy_threshold=evidence_fuzzy_threshold,
+            with_answer_information_metrics=with_answer_information_metrics,
+        )
+        out["eval_log_spec"] = spec
+        out["eval_log_target"] = str(resolve_spec(spec))
+        out["eval_source_files"] = session.source_paths or []
+        return out
+
+    out = copy.deepcopy(row)
+    out["match_status"] = m.status
+    out["match_global_turn_index"] = m.global_turn_index
+    out["match_business_turn_index"] = m.business_turn_index
+    out["match_turn_index"] = m.business_turn_index
+    out["matched_turn_source_log"] = m.turn.source_log_path if m.turn else None
+    out["match_warnings"] = m.warnings
+    out["agent_final_answer"] = m.turn.final_assistant_text() if m.turn else None
+    out["agent_total_tokens"] = m.turn.agent_total_tokens() if m.turn else None
+    out["agent_processing_seconds"] = m.turn.agent_processing_duration_seconds() if m.turn else None
+    _patch_optional_metrics_on_row(
+        out,
+        task,
+        m.turn,
+        tasks_path=tasks_path,
+        with_efficiency=with_efficiency,
+        with_tool_use_effectiveness=with_tool_use_effectiveness,
+        dry_run=dry_run,
+        with_evidence_recall=with_evidence_recall,
+        benchmark_data_root=benchmark_data_root,
+        evidence_fuzzy=evidence_fuzzy,
+        evidence_fuzzy_threshold=evidence_fuzzy_threshold,
+        with_answer_information_metrics=with_answer_information_metrics,
+    )
+    out["eval_log_spec"] = spec
+    out["eval_log_target"] = str(resolve_spec(spec))
+    out["eval_source_files"] = session.source_paths or []
+    logger.info(
+        "Batch checkpoint metrics backfilled task_id={} | {}",
+        task.task_id,
+        _extended_metrics_log_fragment(out),
+    )
+    return out
+
+
+def _is_reusable_checkpoint_row(row: Dict[str, Any]) -> bool:
+    if not row_eval_fingerprint(row):
+        return False
+    if row.get("skipped"):
+        return False
+    if row.get("total_score_0_100") is None:
+        return False
+    return _row_has_completed_judge(row)
+
+
+def _checkpoint_resolve_task_rows(
+    loaded_tasks: List[TaskItem],
+    prev_tasks: Any,
+) -> List[Optional[Dict[str, Any]]]:
+    """
+    Match reusable checkpoint rows by case-content fingerprint, independent
+    of list position and task ID. The result aligns with ``loaded_tasks``.
+    """
+    if not isinstance(prev_tasks, list):
+        return [None] * len(loaded_tasks)
+
+    pool: DefaultDict[str, List[Dict[str, Any]]] = defaultdict(list)
+    for row in prev_tasks:
+        if isinstance(row, dict) and _is_reusable_checkpoint_row(row):
+            pool[row_eval_fingerprint(row)].append(row)
+
+    resolved: List[Optional[Dict[str, Any]]] = []
+    reused = 0
+    for task in loaded_tasks:
+        fp = task_eval_fingerprint(task)
+        candidates = pool.get(fp) or []
+        if not candidates:
+            resolved.append(None)
+            continue
+        src = candidates.pop(0)
+        merged = _merge_checkpoint_row_with_task(src, task)
+        if src.get("task_id") != task.task_id:
+            logger.info(
+                "Reused batch result by content fingerprint, task_id {} -> {}",
+                src.get("task_id"),
+                task.task_id,
+            )
+        resolved.append(merged)
+        reused += 1
+
+    if reused:
+        logger.info(
+            "Batch resume reused {} / {} rows by content fingerprint; "
+            "task ID changes are ignored",
+            reused,
+            len(loaded_tasks),
+        )
+    return resolved
+
+
+def _checkpoint_apply_new_metrics_to_resolved(
+    resolved: List[Optional[Dict[str, Any]]],
+    loaded_tasks: List[TaskItem],
+    *,
+    default_spec: str,
+    get_session,
+    resolve_spec,
+    tasks_path: Path,
+    with_efficiency: bool,
+    with_tool_use_effectiveness: bool,
+    dry_run: bool,
+    with_evidence_recall: bool,
+    benchmark_data_root: Optional[Path],
+    evidence_fuzzy: bool,
+    evidence_fuzzy_threshold: float,
+    with_answer_information_metrics: bool,
+) -> List[Optional[Dict[str, Any]]]:
+    if len(resolved) != len(loaded_tasks):
+        return resolved
+    updated: List[Optional[Dict[str, Any]]] = []
+    for row, task in zip(resolved, loaded_tasks):
+        if row is None:
+            updated.append(None)
+            continue
+        if not _row_needs_metric_refresh(
+            row,
+            with_efficiency=with_efficiency,
+            with_tool_use_effectiveness=with_tool_use_effectiveness,
+            with_evidence_recall=with_evidence_recall,
+            with_answer_information_metrics=with_answer_information_metrics,
+        ):
+            updated.append(copy.deepcopy(row))
+            continue
+        updated.append(
+            _refresh_row_optional_metrics(
+                row,
+                task,
+                tasks_path=tasks_path,
+                default_spec=default_spec,
+                get_session=get_session,
+                resolve_spec=resolve_spec,
+                with_efficiency=with_efficiency,
+                with_tool_use_effectiveness=with_tool_use_effectiveness,
+                dry_run=dry_run,
+                with_evidence_recall=with_evidence_recall,
+                benchmark_data_root=benchmark_data_root,
+                evidence_fuzzy=evidence_fuzzy,
+                evidence_fuzzy_threshold=evidence_fuzzy_threshold,
+                with_answer_information_metrics=with_answer_information_metrics,
+            )
+        )
+    return updated
+
+
+def run_batch(
+    tasks_path: Union[str, Path],
+    *,
+    log_override: Optional[str] = None,
+    with_efficiency: bool = False,
+    with_tool_use_effectiveness: bool = False,
+    dry_run: bool = False,
+    log_base_dir: Optional[Path] = None,
+    with_evidence_recall: bool = True,
+    benchmark_data_root: Optional[Path] = None,
+    evidence_fuzzy: bool = False,
+    evidence_fuzzy_threshold: float = 0.86,
+    with_answer_information_metrics: bool = False,
+    checkpoint_path: Optional[Union[str, Path]] = None,
+    overwrite: bool = False,
+    show_progress: bool = False,
+) -> Dict[str, Any]:
+    tasks_path = Path(tasks_path)
+    loaded = load_tasks_document(tasks_path)
+    logger.info(
+        "Loaded {} evaluation tasks (format={})",
+        len(loaded.tasks),
+        loaded.format,
+    )
+    er_root = benchmark_data_root if benchmark_data_root is not None else resolve_benchmark_data_root()
+    preflight = _active_evidence_preflight(loaded.tasks, er_root)
+    idx_uid = resolve_index_user_id(tasks_path)
+    logger.info(
+        "Evidence recall configuration: benchmark_data_root={} index_user_id={} "
+        "(override: --benchmark-data-root or BENCHMARK_DATA_ROOT; user: "
+        "BENCHMARK_INDEX_USER_ID or tasks path inference)",
+        str(er_root.resolve()) if er_root else None,
+        idx_uid,
+    )
+    bases = _log_bases_for_tasks_file(tasks_path, loaded.format, log_base_dir)
+    default_spec = _resolve_log_spec(
+        loaded.log_path, log_override, tasks_path, loaded_format=loaded.format
+    )
+    get_session, resolve_spec = _session_getter_for_bases(bases)
+
+    default_target = resolve_spec(default_spec)
+    default_session = get_session(default_spec)
+    default_log_content_fingerprint = log_content_fingerprint(
+        default_session.source_paths
+    )
+    # Dry runs ignore resume data and write at most one final report.
+    persist_path: Optional[Path] = Path(checkpoint_path).resolve() if checkpoint_path else None
+    resume_path: Optional[Path] = persist_path if (persist_path is not None and not dry_run) else None
+    if dry_run and persist_path:
+        logger.info(
+            "batch dry_run: resume and incremental checkpoints disabled; "
+            "final output -> {}",
+            persist_path,
+        )
+    if resume_path and overwrite:
+        logger.info("Batch checkpoint overwrite=true; restarting and replacing {}", resume_path)
+    elif resume_path and not overwrite:
+        logger.info("Batch checkpoint path={} (resume when compatible)", resume_path)
+
+    logger.info(
+        "Batch started path={} dry_run={} default_trace={} | session: "
+        "all_turns={} business_turns={} | "
+        "evidence_recall={} tool_use_effectiveness={} answer_information_metrics={} efficiency={}",
+        tasks_path,
+        dry_run,
+        default_target,
+        len(default_session.turns),
+        len(default_session.business_turns()),
+        with_evidence_recall,
+        with_tool_use_effectiveness,
+        with_answer_information_metrics,
+        with_efficiency,
+    )
+
+    meta = _batch_checkpoint_meta(
+        loaded=loaded,
+        tasks_path=tasks_path,
+        default_spec=default_spec,
+        default_target=default_target,
+        log_content_fingerprint=default_log_content_fingerprint,
+        dry_run=dry_run,
+        with_efficiency=with_efficiency,
+        with_tool_use_effectiveness=with_tool_use_effectiveness,
+        with_evidence_recall=with_evidence_recall,
+        benchmark_data_root=benchmark_data_root,
+        evidence_fuzzy=evidence_fuzzy,
+        evidence_fuzzy_threshold=evidence_fuzzy_threshold,
+        with_answer_information_metrics=with_answer_information_metrics,
+    )
+
+    resolved_rows: List[Optional[Dict[str, Any]]] = [None] * len(loaded.tasks)
+    if resume_path and not overwrite:
+        try:
+            if resume_path.exists():
+                prev = json.loads(resume_path.read_text(encoding="utf-8"))
+                if isinstance(prev, dict) and _batch_checkpoint_compatible(prev, meta):
+                    resolved_rows = _checkpoint_resolve_task_rows(
+                        loaded.tasks, prev.get("tasks")
+                    )
+                elif isinstance(prev, dict):
+                    logger.warning(
+                        "Batch checkpoint is incompatible with current cases or "
+                        "settings; restarting: {}",
+                        resume_path,
+                    )
+        except Exception as e:
+            logger.warning(
+                "Failed to read batch checkpoint; restarting: {} err={}",
+                resume_path,
+                e,
+            )
+
+    if any(r is not None for r in resolved_rows):
+        resolved_rows = _checkpoint_apply_new_metrics_to_resolved(
+            resolved_rows,
+            loaded.tasks,
+            default_spec=default_spec,
+            get_session=get_session,
+            resolve_spec=resolve_spec,
+            tasks_path=tasks_path,
+            with_efficiency=with_efficiency,
+            with_tool_use_effectiveness=with_tool_use_effectiveness,
+            dry_run=dry_run,
+            with_evidence_recall=with_evidence_recall,
+            benchmark_data_root=benchmark_data_root,
+            evidence_fuzzy=evidence_fuzzy,
+            evidence_fuzzy_threshold=evidence_fuzzy_threshold,
+            with_answer_information_metrics=with_answer_information_metrics,
+        )
+
+    per_task: List[Dict[str, Any]] = []
+    task_total = len(loaded.tasks)
+    reused_total = sum(row is not None for row in resolved_rows)
+    if show_progress:
+        _print_batch_progress(
+            f"[evaluation started] total={task_total} reused={reused_total} "
+            f"pending={task_total - reused_total}"
+        )
+    for idx, (task, reused) in enumerate(zip(loaded.tasks, resolved_rows), start=1):
+        if reused is not None:
+            row = reused
+        else:
+            if show_progress:
+                _print_batch_progress(f"[{idx}/{task_total}] {task.task_id} evaluating...")
+            spec = task.session_log or default_spec
+            sess = get_session(spec)
+            logger.debug(
+                "Batch evaluating task_id={} session_log_spec={!r} -> {}",
+                task.task_id,
+                spec,
+                resolve_spec(spec),
+            )
+            row = _eval_one_task(
+                task,
+                sess,
+                tasks_path=tasks_path,
+                with_efficiency=with_efficiency,
+                with_tool_use_effectiveness=with_tool_use_effectiveness,
+                dry_run=dry_run,
+                with_evidence_recall=with_evidence_recall,
+                benchmark_data_root=benchmark_data_root,
+                evidence_fuzzy=evidence_fuzzy,
+                evidence_fuzzy_threshold=evidence_fuzzy_threshold,
+                with_answer_information_metrics=with_answer_information_metrics,
+                task_index=idx,
+                task_total=task_total,
+            )
+            row["eval_log_spec"] = spec
+            row["eval_log_target"] = str(resolve_spec(spec))
+            row["eval_source_files"] = sess.source_paths or []
+            if show_progress:
+                _print_batch_progress(
+                    _format_batch_task_progress(idx, task_total, task.task_id, row)
+                )
+        per_task.append(row)
+        if resume_path:
+            out_partial = _assemble_batch_report(
+                loaded=loaded,
+                tasks_path=tasks_path,
+                default_spec=default_spec,
+                default_target=default_target,
+                default_session=default_session,
+                log_content_fingerprint=default_log_content_fingerprint,
+                per_task=per_task,
+                dry_run=dry_run,
+                with_efficiency=with_efficiency,
+                with_tool_use_effectiveness=with_tool_use_effectiveness,
+                with_evidence_recall=with_evidence_recall,
+                benchmark_data_root=benchmark_data_root,
+                evidence_fuzzy=evidence_fuzzy,
+                evidence_fuzzy_threshold=evidence_fuzzy_threshold,
+                with_answer_information_metrics=with_answer_information_metrics,
+            )
+            atomic_write_json(resume_path, out_partial)
+            logger.debug("Batch checkpoint wrote {} tasks -> {}", len(per_task), resume_path)
+
+    out = _assemble_batch_report(
+        loaded=loaded,
+        tasks_path=tasks_path,
+        default_spec=default_spec,
+        default_target=default_target,
+        default_session=default_session,
+        log_content_fingerprint=default_log_content_fingerprint,
+        per_task=per_task,
+        dry_run=dry_run,
+        with_efficiency=with_efficiency,
+        with_tool_use_effectiveness=with_tool_use_effectiveness,
+        with_evidence_recall=with_evidence_recall,
+        benchmark_data_root=benchmark_data_root,
+        evidence_fuzzy=evidence_fuzzy,
+        evidence_fuzzy_threshold=evidence_fuzzy_threshold,
+        with_answer_information_metrics=with_answer_information_metrics,
+    )
+    if preflight is not None:
+        out["evidence_preflight"] = preflight
+    if persist_path:
+        atomic_write_json(persist_path, out)
+
+    sm = out["summary"]
+    logger.info(
+        "Batch completed evaluated={} skipped={} mean_score={} pass_rate={}",
+        sm.get("evaluated_count"),
+        sm.get("skipped_count"),
+        sm.get("mean_score"),
+        sm.get("pass_rate"),
+    )
+    if show_progress:
+        evaluated = int(sm.get("evaluated_count") or 0)
+        passed = int(sm.get("passed_count") or 0)
+        mean_score = sm.get("mean_score")
+        mean_text = f"{float(mean_score):.2f}" if mean_score is not None else "-"
+        _print_batch_progress(
+            f"[evaluation completed] evaluated={evaluated}/{task_total} "
+            f"mean={mean_text} passed={passed}/{evaluated}"
+        )
+    logger.info(
+        "Batch metric summary | evidence_recall mean={} "
+        "(evaluated={}, no_tool_call_excluded={}) | evidence_recall_all mean={} "
+        "(evaluated={}) | answer_information mean_F1={} mean_R={} mean_P={} "
+        "(evaluated={}) | tool_effectiveness mean={} (evaluated={}, no_tool_call_excluded={}) | "
+        "tool_effectiveness_all mean={} (evaluated={})",
+        sm.get("mean_evidence_recall"),
+        sm.get("evidence_recall_evaluated_count"),
+        sm.get("evidence_recall_no_tool_call_excluded_count"),
+        sm.get("mean_evidence_recall_including_no_tool_call"),
+        sm.get("evidence_recall_including_no_tool_call_evaluated_count"),
+        sm.get("mean_answer_info_f1"),
+        sm.get("mean_answer_info_recall"),
+        sm.get("mean_answer_info_precision"),
+        sm.get("answer_info_evaluated_count"),
+        sm.get("mean_effective_tool_ratio"),
+        sm.get("tool_use_effectiveness_evaluated_count"),
+        sm.get("tool_use_effectiveness_no_tool_call_excluded_count"),
+        sm.get("mean_effective_tool_ratio_including_no_tool_call"),
+        sm.get("tool_use_effectiveness_including_no_tool_call_evaluated_count"),
+    )
+    return out
+
+
+def run_one(
+    tasks_path: Union[str, Path],
+    *,
+    task_id: Optional[str] = None,
+    task_index: Optional[int] = None,
+    log_override: Optional[str] = None,
+    with_efficiency: bool = False,
+    with_tool_use_effectiveness: bool = False,
+    dry_run: bool = False,
+    log_base_dir: Optional[Path] = None,
+    with_evidence_recall: bool = True,
+    benchmark_data_root: Optional[Path] = None,
+    evidence_fuzzy: bool = False,
+    evidence_fuzzy_threshold: float = 0.86,
+    with_answer_information_metrics: bool = False,
+) -> Dict[str, Any]:
+    tasks_path = Path(tasks_path)
+    loaded = load_tasks_document(tasks_path)
+    logger.info(
+        "Loaded {} evaluation tasks (format={})",
+        len(loaded.tasks),
+        loaded.format,
+    )
+    er_root_1 = benchmark_data_root if benchmark_data_root is not None else resolve_benchmark_data_root()
+    logger.info(
+        "Evidence recall configuration: benchmark_data_root={} index_user_id={}",
+        str(er_root_1.resolve()) if er_root_1 else None,
+        resolve_index_user_id(tasks_path),
+    )
+    if task_id:
+        task = next((t for t in loaded.tasks if t.task_id == task_id), None)
+        if task is None:
+            raise ValueError(f"Unknown task_id={task_id!r}")
+    elif task_index is not None:
+        if task_index < 0 or task_index >= len(loaded.tasks):
+            raise ValueError(f"task_index out of range: {task_index}")
+        task = loaded.tasks[task_index]
+    else:
+        raise ValueError("Specify --task-id or --task-index")
+
+    preflight = _active_evidence_preflight([task], er_root_1)
+
+    bases = _log_bases_for_tasks_file(tasks_path, loaded.format, log_base_dir)
+    get_session, resolve_spec = _session_getter_for_bases(bases)
+    log_spec = log_override or task.session_log or loaded.log_path
+    if not log_spec:
+        raise ValueError("No agent trace was provided; use --log")
+    logger.info(
+        "run-one requested task_id={!r} task_index={!r}; evaluating task_id={} trace={}",
+        task_id,
+        task_index,
+        task.task_id,
+        resolve_spec(log_spec),
+    )
+    session = get_session(log_spec)
+    logger.info(
+        "run-one session: all_turns={} business_turns={} session_id={}",
+        len(session.turns),
+        len(session.business_turns()),
+        session.session_id,
+    )
+    row = _eval_one_task(
+        task,
+        session,
+        tasks_path=tasks_path,
+        with_efficiency=with_efficiency,
+        with_tool_use_effectiveness=with_tool_use_effectiveness,
+        dry_run=dry_run,
+        with_evidence_recall=with_evidence_recall,
+        benchmark_data_root=benchmark_data_root,
+        evidence_fuzzy=evidence_fuzzy,
+        evidence_fuzzy_threshold=evidence_fuzzy_threshold,
+        with_answer_information_metrics=with_answer_information_metrics,
+    )
+    row["eval_log_spec"] = log_spec
+    row["eval_log_target"] = str(resolve_spec(log_spec))
+    row["eval_source_files"] = session.source_paths or []
+    if preflight is not None:
+        row["evidence_preflight"] = preflight
+    return row
+
+
+def _summarize(per_task: List[Dict[str, Any]]) -> Dict[str, Any]:
+    valid = [x for x in per_task if not x.get("skipped") and x.get("total_score_0_100") is not None]
+    scores = [float(x["total_score_0_100"]) for x in valid]
+    mean_score = sum(scores) / len(scores) if scores else None
+    passed_n = sum(1 for x in valid if x.get("passed"))
+    pass_rate = passed_n / len(valid) if valid else None
+
+    by_cap: Dict[str, List[float]] = defaultdict(list)
+    by_sub: Dict[str, List[float]] = defaultdict(list)
+    by_dim: Dict[str, List[float]] = defaultdict(list)
+    for x in valid:
+        s = float(x["total_score_0_100"])
+        by_cap[x["capability"]].append(s)
+        by_sub[x["sub_capability"]].append(s)
+        by_dim[x["dimension"]].append(s)
+
+    def avg_map(m: Dict[str, List[float]]) -> Dict[str, float]:
+        return {k: round(sum(v) / len(v), 4) for k, v in m.items()}
+
+    ai_recalls: List[float] = []
+    ai_precisions: List[float] = []
+    ai_f1s: List[float] = []
+    for x in per_task:
+        aim = x.get("answer_information_metrics")
+        if not isinstance(aim, dict):
+            continue
+        if aim.get("error"):
+            continue
+        r = aim.get("recall")
+        p = aim.get("precision")
+        f = aim.get("f1")
+        if isinstance(r, (int, float)) and isinstance(p, (int, float)) and isinstance(f, (int, float)):
+            ai_recalls.append(float(r))
+            ai_precisions.append(float(p))
+            ai_f1s.append(float(f))
+
+    answer_info_summary: Dict[str, Any] = {
+        "answer_info_evaluated_count": len(ai_recalls),
+        "mean_answer_info_recall": round(sum(ai_recalls) / len(ai_recalls), 4) if ai_recalls else None,
+        "mean_answer_info_precision": round(sum(ai_precisions) / len(ai_precisions), 4)
+        if ai_precisions
+        else None,
+        "mean_answer_info_f1": round(sum(ai_f1s) / len(ai_f1s), 4) if ai_f1s else None,
+    }
+
+    er_vals: List[float] = []
+    er_vals_including_no_tool_call: List[float] = []
+    er_no_tool_call_excluded_count = 0
+    for x in per_task:
+        er = x.get("evidence_recall")
+        if not isinstance(er, dict):
+            continue
+        if er.get("skip_reason") == "disabled":
+            continue
+        r_all = er.get("recall_including_no_tool_call")
+        if isinstance(r_all, (int, float)):
+            er_vals_including_no_tool_call.append(float(r_all))
+        r = er.get("recall")
+        if isinstance(r, (int, float)):
+            er_vals.append(float(r))
+        else:
+            dbg = er.get("debug") if isinstance(er.get("debug"), dict) else {}
+            if dbg.get("has_tool_calls") is False:
+                er_no_tool_call_excluded_count += 1
+    evidence_recall_summary: Dict[str, Any] = {
+        "evidence_recall_evaluated_count": len(er_vals),
+        "mean_evidence_recall": round(sum(er_vals) / len(er_vals), 4) if er_vals else None,
+        "evidence_recall_including_no_tool_call_evaluated_count": len(er_vals_including_no_tool_call),
+        "mean_evidence_recall_including_no_tool_call": (
+            round(sum(er_vals_including_no_tool_call) / len(er_vals_including_no_tool_call), 4)
+            if er_vals_including_no_tool_call
+            else None
+        ),
+        "evidence_recall_no_tool_call_excluded_count": er_no_tool_call_excluded_count,
+    }
+
+    tue_ratios: List[float] = []
+    tue_ratios_including_no_tool_call: List[float] = []
+    tue_no_tool_call_excluded_count = 0
+    for x in per_task:
+        tue = x.get("tool_use_effectiveness")
+        if not isinstance(tue, dict) or tue.get("error"):
+            continue
+        r = tue.get("effective_tool_ratio")
+        if not isinstance(r, (int, float)):
+            continue
+        rv = float(r)
+        tue_ratios_including_no_tool_call.append(rv)
+        t_total = tue.get("tool_call_total")
+        if isinstance(t_total, (int, float)) and int(t_total) <= 0:
+            tue_no_tool_call_excluded_count += 1
+            continue
+        tue_ratios.append(rv)
+    tool_use_summary: Dict[str, Any] = {
+        "tool_use_effectiveness_evaluated_count": len(tue_ratios),
+        "mean_effective_tool_ratio": round(sum(tue_ratios) / len(tue_ratios), 4) if tue_ratios else None,
+        "tool_use_effectiveness_including_no_tool_call_evaluated_count": len(
+            tue_ratios_including_no_tool_call
+        ),
+        "mean_effective_tool_ratio_including_no_tool_call": (
+            round(sum(tue_ratios_including_no_tool_call) / len(tue_ratios_including_no_tool_call), 4)
+            if tue_ratios_including_no_tool_call
+            else None
+        ),
+        "tool_use_effectiveness_no_tool_call_excluded_count": tue_no_tool_call_excluded_count,
+    }
+
+    from eval.core.capabilities import summarize_capability_item_stats
+
+    capability_item_stats = summarize_capability_item_stats(per_task)
+
+    return {
+        "evaluated_count": len(valid),
+        "skipped_count": sum(1 for x in per_task if x.get("skipped")),
+        "mean_score": round(mean_score, 4) if mean_score is not None else None,
+        "pass_rate": round(pass_rate, 4) if pass_rate is not None else None,
+        "passed_count": passed_n,
+        "by_capability": avg_map(by_cap),
+        "by_sub_capability": avg_map(by_sub),
+        "by_dimension": avg_map(by_dim),
+        "capability_item_stats": capability_item_stats,
+        **answer_info_summary,
+        **evidence_recall_summary,
+        **tool_use_summary,
+    }
+
+
+def write_report(data: Dict[str, Any], out_path: Union[str, Path]) -> None:
+    atomic_write_json(Path(out_path), data)
+
+
+def atomic_write_json(path: Path, data: Any) -> None:
+    """Write JSON atomically with a same-volume replacement."""
+    path = path.resolve()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    tmp.replace(path)
+
+
+def _batch_checkpoint_meta(
+    *,
+    loaded,
+    tasks_path: Path,
+    default_spec: str,
+    default_target: Path,
+    log_content_fingerprint: str,
+    dry_run: bool,
+    with_efficiency: bool,
+    with_tool_use_effectiveness: bool,
+    with_evidence_recall: bool,
+    benchmark_data_root: Optional[Path],
+    evidence_fuzzy: bool,
+    evidence_fuzzy_threshold: float,
+    with_answer_information_metrics: bool,
+) -> Dict[str, Any]:
+    br = benchmark_data_root
+    bdr = str(br.resolve()) if br is not None else None
+    if bdr is None:
+        r = resolve_benchmark_data_root()
+        bdr = str(r.resolve()) if r else None
+    return {
+        "schema_version": loaded.schema_version,
+        "tasks_path": str(tasks_path.resolve()),
+        "task_file_format": loaded.format,
+        "dry_run": dry_run,
+        "with_efficiency": with_efficiency,
+        "with_tool_use_effectiveness": with_tool_use_effectiveness,
+        "with_evidence_recall": with_evidence_recall,
+        "benchmark_data_root": bdr,
+        "evidence_root": _active_evidence_root_text(Path(bdr)) if bdr else None,
+        "evidence_fuzzy": evidence_fuzzy,
+        "evidence_fuzzy_threshold": evidence_fuzzy_threshold,
+        "with_answer_information_metrics": with_answer_information_metrics,
+        "log_path_spec": default_spec,
+        "log_path": str(Path(default_target).resolve()),
+        "log_content_fingerprint": log_content_fingerprint,
+    }
+
+
+# Older reports may omit these keys; compare them using current defaults.
+_CHECKPOINT_META_DEFAULTS: Dict[str, Any] = {
+    "evidence_fuzzy": False,
+    "evidence_fuzzy_threshold": 0.86,
+}
+
+
+def _normalize_checkpoint_benchmark_data_root(value: Any) -> Optional[str]:
+    """Normalize benchmark_data_root for comparison without env fallback."""
+    if value is None or value == "":
+        return None
+    try:
+        return str(Path(str(value)).expanduser().resolve())
+    except (OSError, ValueError):
+        return str(value).strip() or None
+
+
+def _normalize_log_path_for_meta(value: Any) -> Optional[str]:
+    if value is None or value == "":
+        return None
+    try:
+        return str(Path(str(value)).expanduser().resolve())
+    except (OSError, ValueError):
+        return str(value).strip() or None
+
+
+def _checkpoint_meta_value_equal(key: str, prev_v: Any, cur_v: Any) -> bool:
+    if key == "benchmark_data_root":
+        return _normalize_checkpoint_benchmark_data_root(prev_v) == _normalize_checkpoint_benchmark_data_root(
+            cur_v
+        )
+    if key == "evidence_root":
+        return _normalize_checkpoint_benchmark_data_root(prev_v) == _normalize_checkpoint_benchmark_data_root(
+            cur_v
+        )
+    if key in ("log_path_spec", "log_path"):
+        return _normalize_log_path_for_meta(prev_v) == _normalize_log_path_for_meta(cur_v)
+    if prev_v is None and key in _CHECKPOINT_META_DEFAULTS:
+        prev_v = _CHECKPOINT_META_DEFAULTS[key]
+    return prev_v == cur_v
+
+
+def _batch_checkpoint_compatible(prev: Dict[str, Any], meta: Dict[str, Any]) -> bool:
+    for k, v in meta.items():
+        if k == "log_source_files":
+            continue
+        prev_v = prev.get(k)
+        if not _checkpoint_meta_value_equal(k, prev_v, v):
+            logger.debug(
+                "Batch checkpoint metadata differs key={} previous={!r} current={!r}",
+                k,
+                prev.get(k),
+                v,
+            )
+            return False
+    return True
+
+
+def _assemble_batch_report(
+    *,
+    loaded,
+    tasks_path: Path,
+    default_spec: str,
+    default_target: Path,
+    default_session: ParsedSession,
+    log_content_fingerprint: str,
+    per_task: List[Dict[str, Any]],
+    dry_run: bool,
+    with_efficiency: bool,
+    with_tool_use_effectiveness: bool,
+    with_evidence_recall: bool,
+    benchmark_data_root: Optional[Path],
+    evidence_fuzzy: bool,
+    evidence_fuzzy_threshold: float,
+    with_answer_information_metrics: bool,
+) -> Dict[str, Any]:
+    summary = _summarize(per_task)
+    br = benchmark_data_root
+    resolved_br = br if br is not None else resolve_benchmark_data_root()
+    out: Dict[str, Any] = {
+        "schema_version": loaded.schema_version,
+        "tasks_path": str(tasks_path.resolve()),
+        "task_file_format": loaded.format,
+        "log_path_spec": default_spec,
+        "log_path": str(Path(default_target).resolve()),
+        "log_source_files": default_session.source_paths or [],
+        "log_content_fingerprint": log_content_fingerprint,
+        "dry_run": dry_run,
+        "with_efficiency": with_efficiency,
+        "with_tool_use_effectiveness": with_tool_use_effectiveness,
+        "with_evidence_recall": with_evidence_recall,
+        "benchmark_data_root": str(resolved_br.resolve()) if resolved_br else None,
+        "evidence_root": _active_evidence_root_text(resolved_br),
+        "evidence_fuzzy": evidence_fuzzy,
+        "evidence_fuzzy_threshold": evidence_fuzzy_threshold,
+        "with_answer_information_metrics": with_answer_information_metrics,
+        "tasks": per_task,
+        "summary": summary,
+        "task_count_expected": len(loaded.tasks),
+        "batch_all_tasks_completed": len(per_task) == len(loaded.tasks),
+    }
+    if loaded.load_stats is not None:
+        out["case_load_stats"] = loaded.load_stats
+    if loaded.skipped_empty_prompt:
+        out["skipped_empty_prompt"] = loaded.skipped_empty_prompt
+    return out
