@@ -94,19 +94,19 @@ def _approx_tool_result_text_chars(turn: ConversationTurn) -> int:
 def _prompt_matches_turn(mode: QueryMatchMode, prompt: str, user: str) -> bool:
     if mode == "exact":
         return prompt == user
+    prompt = normalize_query_match_text(prompt)
+    user = normalize_query_match_text(user)
     if not prompt or not user:
         return False
+    if mode == "normalized":
+        return prompt == user
     return prompt in user or user in prompt
 
 
 def query_texts_match(
     mode: QueryMatchMode, prompt_a: str, prompt_b: str
 ) -> bool:
-    return _prompt_matches_turn(
-        mode,
-        normalize_query_match_text(prompt_a),
-        normalize_query_match_text(prompt_b),
-    )
+    return _prompt_matches_turn(mode, prompt_a, prompt_b)
 
 
 @dataclass
@@ -141,14 +141,11 @@ def match_task_to_session(task: TaskItem, session: ParsedSession) -> MatchResult
             warnings=[],
         )
 
-    prompt = task.prompt_normalized()
     matches = [
         (index, turn)
         for index, turn in enumerate(session.turns)
         if turn.is_business
-        and _prompt_matches_turn(
-            task.query_match, prompt, normalize_query_match_text(turn.user_raw)
-        )
+        and _prompt_matches_turn(task.query_match, task.prompt, turn.user_raw)
     ]
     if not matches:
         return MatchResult(

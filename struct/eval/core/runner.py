@@ -104,26 +104,53 @@ def _session_getter_for_bases(bases: List[Path]):
     return get_session, resolve_spec
 
 
-def prompt_eval_fingerprint(prompt: str) -> str:
-    """用例 Query 指纹（仅 prompt 文本，不含 task_id）。"""
-    text = str(prompt or "").strip()
-    if not text:
-        return ""
-    return hashlib.sha256(text.encode("utf-8")).hexdigest()[:16]
+_TASK_EVAL_FINGERPRINT_VERSION = "v2"
+
+
+def _normalized_optional_text(value: Any) -> Optional[str]:
+    text = str(value or "").strip()
+    return text or None
+
+
+def _normalized_id_list(values: Optional[List[str]]) -> List[str]:
+    return [str(value).strip().lower() for value in (values or []) if str(value).strip()]
 
 
 def task_eval_fingerprint(task: TaskItem) -> str:
-    return prompt_eval_fingerprint(task.prompt or "")
+    """Hash every task field that can change matching, judging, or metrics."""
+    prompt = str(task.prompt or "").strip()
+    if not prompt:
+        return ""
+    payload = {
+        "prompt": prompt,
+        "expected_behavior": str(task.expected_behavior or "").strip(),
+        "grading_criteria": str(task.grading_criteria or "").strip(),
+        "pass_threshold": float(task.pass_threshold),
+        "query_match": task.query_match,
+        "turn_index": task.turn_index,
+        "session_log": _normalized_optional_text(task.session_log),
+        "evidence_ids": _normalized_id_list(task.evidence_ids),
+        "supporting_artifact_ids": _normalized_id_list(task.supporting_artifact_ids),
+        "benchmark_user_id": _normalized_optional_text(task.benchmark_user_id),
+        "metadata_gt": str(task.metadata_gt or "").strip(),
+    }
+    encoded = json.dumps(
+        payload,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    digest = hashlib.sha256(encoded).hexdigest()[:16]
+    return f"{_TASK_EVAL_FINGERPRINT_VERSION}:{digest}"
 
 
 def row_eval_fingerprint(row: Dict[str, Any]) -> str:
-    """检查点行 Query 指纹，与 task_eval_fingerprint 相同（仅 prompt）。"""
-    fp = prompt_eval_fingerprint(str(row.get("prompt") or ""))
-    if fp:
-        return fp
+    """Return only current-version fingerprints; legacy prompt hashes expire."""
     stored = row.get("task_eval_fingerprint")
-    if isinstance(stored, str) and stored.strip():
-        return stored.strip()
+    if isinstance(stored, str):
+        value = stored.strip()
+        if value.startswith(f"{_TASK_EVAL_FINGERPRINT_VERSION}:"):
+            return value
     return ""
 
 
@@ -1043,11 +1070,11 @@ def _refresh_row_optional_metrics(
 def _is_reusable_checkpoint_row(row: Dict[str, Any]) -> bool:
     if not row_eval_fingerprint(row):
         return False
-    if row.get("judge") is not None:
-        return True
     if row.get("skipped"):
-        return True
-    return row.get("total_score_0_100") is not None
+        return False
+    if row.get("total_score_0_100") is None:
+        return False
+    return _row_has_completed_judge(row)
 
 
 def _checkpoint_resolve_task_rows(

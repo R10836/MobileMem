@@ -53,6 +53,17 @@ def _coerce_int(v: Any) -> Optional[int]:
         return None
 
 
+def _coerce_index_alias(item: Dict[str, Any], *keys: str) -> Optional[int]:
+    for key in keys:
+        raw = item.get(key)
+        if raw is None or str(raw).strip().lower() in ("null", "none", ""):
+            continue
+        value = _coerce_int(raw)
+        if value is not None:
+            return value
+    return None
+
+
 def _coerce_bool(v: Any) -> bool:
     if isinstance(v, bool):
         return v
@@ -74,13 +85,10 @@ def _normalize_matches(
     for i, m in enumerate(raw_matches):
         if not isinstance(m, dict):
             continue
-        gi = _coerce_int(m.get("gold_index", m.get("goldIndex")))
+        gi = _coerce_index_alias(m, "gold_index", "goldIndex")
         if gi is None:
             gi = i if gold_n and i < gold_n else None
-        ai = _coerce_int(m.get("agent_index", m.get("agentIndex")))
-        if m.get("agent_index") is None or m.get("agentIndex") is None:
-            if str(m.get("agent_index", "")).lower() in ("null", "none", ""):
-                ai = None
+        ai = _coerce_index_alias(m, "agent_index", "agentIndex")
         rec = _coerce_bool(m.get("recalled", m.get("recall")))
         reason = m.get("brief_reason") or m.get("reason") or ""
         rows.append(

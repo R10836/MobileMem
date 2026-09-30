@@ -21,7 +21,7 @@ from eval.evidence.catalog import load_active_evidence_index
 
 
 def _tokens(text: str) -> set[str]:
-    normalized = re.sub(r"\s+", "", text.lower())
+    normalized = text.lower()
     ascii_words = set(re.findall(r"[a-z0-9_]{2,}", normalized))
     cjk = "".join(re.findall(r"[\u4e00-\u9fff]", normalized))
     cjk_terms = {cjk[index : index + 2] for index in range(max(0, len(cjk) - 1))}

@@ -190,8 +190,9 @@ task score = earned checkpoint points - deductions
 
 Evidence recall is reported separately from answer quality, so a missed record
 is not penalized twice. `report.json` is updated after every case and also acts
-as a checkpoint. Run the same command to resume, or add `--overwrite` to start
-over.
+as a checkpoint. Run the same command to resume. Changed case content invalidates
+old checkpoints, while failed or skipped cases are retried automatically; add
+`--overwrite` to restart every case.
 
 ## Minimal Agent Example (Optional)
 

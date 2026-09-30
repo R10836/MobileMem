@@ -136,7 +136,7 @@ def is_active_evidence_root(path: Path) -> bool:
     root = Path(path)
     if any(part.lower() == "archive" for part in root.parts):
         return False
-    return any((root / relative).is_file() for relative, _ in CORE_SOURCES)
+    return all((root / relative).is_file() for relative, _ in CORE_SOURCES)
 
 
 def _record_id(record: dict[str, Any]) -> str | None:
@@ -400,7 +400,7 @@ def validate_tasks_against_index(
                 EvidenceIssue(task.task_id, "duplicate_task_evidence_id", "题内 evidence_id 重复")
             )
         gt_count = _gt_count(task.metadata_gt or "")
-        if evidence_ids and gt_count != len(evidence_ids):
+        if gt_count != len(evidence_ids):
             report.errors.append(
                 EvidenceIssue(
                     task.task_id,
