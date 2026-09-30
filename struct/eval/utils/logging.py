@@ -1,4 +1,4 @@
-"""CLI / 库共用的 loguru 初始化（各模块直接使用 ``from loguru import logger``）。"""
+"""Configure the shared Loguru logger used by the CLI and library."""
 
 from __future__ import annotations
 
@@ -10,7 +10,7 @@ from loguru import logger
 
 
 def _entry_script_label() -> str:
-    """当前进程的入口脚本展示名（尽量区分 python -m 与直接 python xxx.py）。"""
+    """Return a useful entry-script label for module and direct execution."""
     if not sys.argv:
         return ""
     p = Path(sys.argv[0])
@@ -27,14 +27,10 @@ def _log_record_patcher(record: Any) -> None:
 
 
 def setup_cli_logging(verbose: int = 0) -> None:
-    """
-    将 loguru 默认 sink 重置为 stderr，格式与 CLI -v/-vv 一致。
+    """Reset Loguru to stderr using the CLI's ``-v``/``-vv`` format.
 
-    每条日志包含：入口脚本名、**调用处** 源码文件与行号、模块名、消息。
-
-    - verbose==0：仅 WARNING 及以上
-    - verbose>=1：INFO
-    - verbose>=2：DEBUG
+    Each record includes the entry script, call-site file and line, and
+    message. Level zero shows warnings, one shows info, and two shows debug.
     """
     logger.remove()
 

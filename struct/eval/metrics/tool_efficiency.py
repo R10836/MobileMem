@@ -1,4 +1,4 @@
-"""工具调用效率：T、R、Q 与 Score = Q × R × 1/(ln(1+T)+1)。"""
+"""Tool efficiency using T, R, Q, and Score = Q * R / (ln(1+T)+1)."""
 
 from __future__ import annotations
 
@@ -58,9 +58,8 @@ def _is_error_result(is_error: bool, raw: str, details: dict[str, Any] | None) -
 
 def compute_tool_efficiency(turn: ConversationTurn, quality_q: float) -> dict[str, Any]:
     """
-    quality_q: 任务完成质量 Q∈[0,1]，通常来自 Judge 总分/100。
-    工具调用与 ``toolResult`` 按 ``toolCallId`` 配对（见 ``ConversationTurn.iter_tool_call_events``），
-    不再使用 ``calls[i]`` 与 ``tool_results[i]`` 下标。
+    ``quality_q`` is task quality in [0, 1], normally Judge score / 100.
+    Tool calls and results are paired by ``toolCallId`` instead of list index.
     """
     events = turn.iter_tool_call_events()
     T = len(events)

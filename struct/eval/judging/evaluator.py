@@ -1,4 +1,4 @@
-"""LLM Judge：按检查点评分标准输出结构化 JSON；支持多模型并行与均值汇总。"""
+"""Run one or more LLM Judges and aggregate structured scores."""
 
 from __future__ import annotations
 
@@ -89,7 +89,7 @@ JUDGE_SYSTEM = """你是手机 AI Agent 记忆系统的专业评测裁判。你�
 
 @dataclass
 class JudgeEnsembleResult:
-    """多模型或单模型 Judge 的统一结果；汇总分与通过判定基于成功模型的平均分。"""
+    """Unified result whose score is the mean of successful Judge models."""
 
     mean_total_score_0_100: float | None
     aggregate_passed: bool | None
@@ -126,7 +126,7 @@ def _extract_rule_lines(section_text: str) -> list[str]:
 
 
 def _expected_rule_counts(task: TaskItem) -> tuple[int, int]:
-    """得分细则条数；扣分条数含同条多档展开（与 grading_capability 口径一致）。"""
+    """Return score and expanded deduction rule counts."""
     criteria = task.grading_criteria
     score_n = len(score_rule_lines(criteria))
     if score_n <= 0:
@@ -138,7 +138,7 @@ def _expected_rule_counts(task: TaskItem) -> tuple[int, int]:
 
 
 def _deduction_rule_per_slot(task: TaskItem) -> list[str]:
-    """与 deductions 下标对齐：每条 slot 对应其来源扣分细则原文。"""
+    """Align each deduction slot with its source rule text."""
     out: list[str] = []
     for line in deduction_rule_lines(task.grading_criteria):
         for _ in range(_deduction_capability_slots(line)):
@@ -163,7 +163,7 @@ class _DeductionRuleSpec:
 
 
 def _deduction_max_points_per_slot(line: str) -> list[float]:
-    """单条扣分细则各档上限：主档「扣分=N」+ 同条内「按 M/处」附加档。"""
+    """Parse primary and per-occurrence tiers from a deduction rule."""
     s = str(line or "").strip()
     m = _DEDUCTION_MAX_POINTS_RE.search(s)
     if not m:
@@ -223,7 +223,8 @@ def _expected_deduction_max_points(task: TaskItem) -> list[float]:
     ]
 
 
-# reason 承认记忆检索不完美时不得满分（用短语/正则，避免「只是」「没有…不符」误伤）
+# A retrieval reason that admits incompleteness cannot receive full points.
+# Phrase filtering avoids negated statements that assert no omission.
 _MEMORY_IMPERFECTION_NEG_PHRASES = (
     "未遗漏",
     "无遗漏",
@@ -391,44 +392,26 @@ def _sync_max_points_from_criteria(out: JudgeOutput, task: TaskItem) -> JudgeOut
     return out.model_copy(update={"checkpoints": new_cps, "deductions": new_deds})
 
 
-def _enforce_memory_retrieval_no_full_if_admitted(
+def _validate_memory_retrieval_score_consistency(
     out: JudgeOutput, task: TaskItem
-) -> JudgeOutput:
-    """记忆检索得分：reason 承认混入/遗漏等时禁止 score==max_points。"""
+) -> None:
+    """Reject a full retrieval score whose explanation admits incompleteness."""
     rules = _score_rule_lines(task)
-    new_cps = []
     for i, cp in enumerate(out.checkpoints):
         rule = rules[i] if i < len(rules) else ""
         if not _rule_is_memory_retrieval(rule):
-            new_cps.append(cp)
             continue
         mx = float(cp.max_points or 0)
         sc = float(cp.score or 0)
         rsn = str(cp.reason or "")
         if mx <= 1e-9 or sc < mx - 1e-6:
-            new_cps.append(cp)
             continue
         if not _reason_admits_memory_retrieval_imperfection(rsn):
-            new_cps.append(cp)
             continue
-        cap = max(0.0, mx - max(1.0, mx * 0.05))
-        if sc > cap + 1e-6:
-            logger.debug(
-                "记忆检索满分校正 task_id={} cp={} score {} -> {}（reason 承认不完美）",
-                task.task_id,
-                i,
-                sc,
-                cap,
-            )
-        new_cps.append(
-            cp.model_copy(
-                update={
-                    "score": cap,
-                    "passed": False,
-                }
-            )
+        raise ValueError(
+            "Contradictory retrieval checkpoint: matched_gt_ids yields full "
+            "credit, but the reason admits omissions, contamination, or incompleteness"
         )
-    return out.model_copy(update={"checkpoints": new_cps})
 
 
 def _validate_output_rule_coverage(task: TaskItem, out: JudgeOutput) -> None:
@@ -438,17 +421,17 @@ def _validate_output_rule_coverage(task: TaskItem, out: JudgeOutput) -> None:
 
     if got_score_n != exp_score_n:
         raise ValueError(
-            f"checkpoints 条数须与得分细则一致：期望 {exp_score_n} 条，实际 {got_score_n} 条"
+            f"Checkpoint count must match score rules: expected {exp_score_n}, got {got_score_n}"
         )
     if exp_ded_n == 0:
         if got_ded_n != 0:
             raise ValueError(
-                f"未提供扣分标准时 deductions 应为空，实际 {got_ded_n} 条"
+                f"Deductions must be empty without deduction rules; got {got_ded_n}"
             )
         return
     if got_ded_n != exp_ded_n:
         raise ValueError(
-            f"deductions 条数须与扣分细则一致：期望 {exp_ded_n} 条，实际 {got_ded_n} 条"
+            f"Deduction count must match deduction rules: expected {exp_ded_n}, got {got_ded_n}"
         )
 
 
@@ -464,7 +447,7 @@ _OMISSION_DEDUCTION_PATTERNS = (
 
 _MEMORY_RETRIEVAL_MARKERS = ("记忆检索", "能力=记忆检索")
 
-# 得分原因中不应出现的「误召/漏召扣分」类表述（记忆检索得分项）
+# Retrieval checkpoint reasons must not contain deduction-side language.
 _FORBIDDEN_SCORE_SIDE_CLAUSE = re.compile(
     r"[；;，,]?[^；;，,。]*(?:误召|漏召|未覆盖|未提及|未召回)[^；;，,。]*(?:扣|扣分|另扣|重复扣)[^；;，,。]*",
     re.IGNORECASE,
@@ -474,7 +457,7 @@ _FORBIDDEN_SCORE_SIDE_PHRASE = re.compile(
     re.IGNORECASE,
 )
 
-# 扣分原因中不应出现的遗漏类表述
+# Deduction reasons must not penalize omissions.
 _FORBIDDEN_OMISSION_IN_DEDUCTION = re.compile(
     r"[；;，,]?[^；;，,。]*(?:漏召|未召回|未提及|未覆盖|未命中|遗漏|缺失)[^；;，,。]*",
     re.IGNORECASE,
@@ -485,7 +468,7 @@ _DEDUCTION_OMISSION_IN_SCORE_ONLY = (
     "属于漏召或未覆盖，已在得分检查点体现，本条不扣分。"
 )
 
-# reason 中「已扣分」叙述（points=0 时应剔除）
+# Remove claims of deducted points when points is zero.
 _DEDUCTION_AMOUNT_CLAUSE_RE = re.compile(
     r"[；;，,]?[^；;，,。]*(?:"
     r"按\s*\d+(?:\.\d+)?\s*分\s*/?\s*(?:条|处)"
@@ -505,7 +488,7 @@ _CLAIMED_SCORE_POINTS_RE = re.compile(
     re.IGNORECASE,
 )
 
-# 层 1：可结构归一化的事实锚点（日期、金额）；不核对专名/地名/中英文别名
+# Layer 1 compares normalized date and amount anchors, not proper names.
 _DATE_IN_TEXT_RE = re.compile(
     r"\d{4}\s*[-/年]\s*\d{1,2}(?:\s*[-/月]\s*\d{1,2})?"
     r"|\d{4}\s*年\s*\d{1,2}\s*月\s*\d{1,2}\s*日?"
@@ -521,6 +504,7 @@ _REASON_AUDIT_NOTE_RE = re.compile(r"（核对[^）]*）")
 _GT_CIRCLE_IDS = "①②③④⑤⑥⑦⑧⑨⑩⑪⑫⑬⑭⑮⑯⑰⑱⑲⑳㉑㉒㉓㉔㉕㉖㉗㉘㉙㉚㉛㉜㉝㉞㉟㊱㊲㊳㊴㊵"
 _GT_ID_IN_TEXT_RE = re.compile(rf"GT\s*([{_GT_CIRCLE_IDS}])", re.IGNORECASE)
 _GT_ENTRY_HEAD_RE = re.compile(rf"^([{_GT_CIRCLE_IDS}])")
+
 
 def _parse_date_to_key(raw: str) -> str | None:
     s = str(raw or "").strip()
@@ -570,10 +554,7 @@ def _structural_anchor_count(text: str) -> int:
 
 
 def _structural_support_ratio(source_text: str, assistant_text: str) -> tuple[float, int]:
-    """
-    层 1：source 中的日期/金额键是否在 assistant 中出现（归一化后集合交集）。
-    返回 (支持率, 锚点数量)；锚点数为 0 时支持率视为 1.0（无硬事实可核对）。
-    """
+    """Return support ratio and count for normalized date/amount anchors."""
     d_src = _date_keys_from_text(source_text)
     m_src = _money_keys_from_text(source_text)
     n = len(d_src) + len(m_src)
@@ -586,7 +567,7 @@ def _structural_support_ratio(source_text: str, assistant_text: str) -> tuple[fl
 
 
 def _parse_gt_entries(metadata_gt: str) -> dict[str, str]:
-    """解析 metadata.GT 为 {「①」: 条目正文, ...}。"""
+    """Parse metadata.GT into a mapping from circled label to item text."""
     raw = str(metadata_gt or "").strip()
     if not raw:
         return {}
@@ -651,7 +632,7 @@ def _enforce_memory_gt_equal_weight(out: JudgeOutput, task: TaskItem) -> JudgeOu
 
 
 def _claimed_recalled_gt_ids(reason: str) -> list[str]:
-    """从 reason 正向召回叙述中解析 Judge 声称已召回的 GT 序号（去重保序）。"""
+    """Parse ordered unique GT labels claimed as recalled in a reason."""
     seen: set[str] = set()
     ordered: list[str] = []
     for seg in re.split(r"[；;。]", str(reason or "")):
@@ -676,10 +657,7 @@ def _claimed_recalled_gt_ids(reason: str) -> list[str]:
 def _layer2_gt_claim_support_ratio(
     reason: str, metadata_gt: str, assistant_text: str
 ) -> tuple[float, int, int]:
-    """
-    层 2：对 reason 中声称已召回的每条 GT，用该条 GT 原文中的日期/金额锚点核对回复。
-    返回 (平均支持率, 参与核对的 GT 条数, 总硬锚点数)。
-    """
+    """Check claimed GT items against date and amount anchors in the answer."""
     entries = _parse_gt_entries(metadata_gt)
     claimed = _claimed_recalled_gt_ids(reason)
     if not entries or not claimed:
@@ -715,10 +693,7 @@ def _resolve_verify_ratio(
     metadata_gt: str,
     assistant_text: str,
 ) -> tuple[float, str]:
-    """
-    记忆检索且存在 GT：优先层 2；否则层 1（reason 内硬事实）。
-    返回 (ratio, mode_label)。
-    """
+    """Return support ratio and mode, preferring GT-aware verification."""
     if memory and str(metadata_gt or "").strip():
         ratio, n_gt, n_anch = _layer2_gt_claim_support_ratio(
             reason, metadata_gt, assistant_text
@@ -744,7 +719,7 @@ def _positive_recall_text(reason: str) -> str:
 
 
 def _extract_structural_tokens_from_reason(reason: str) -> list[str]:
-    """测试/调试：从 reason 正向叙述中提取日期/金额字面量。"""
+    """Extract date and amount literals for tests and debugging."""
     text = _positive_recall_text(reason)
     tokens: list[str] = []
     for m in _DATE_IN_TEXT_RE.finditer(text):
@@ -755,7 +730,7 @@ def _extract_structural_tokens_from_reason(reason: str) -> list[str]:
 
 
 def _recall_claim_support_ratio(reason: str, assistant_text: str) -> float:
-    """测试/调试：对 reason 正向叙述中的硬事实锚点计算支持率。"""
+    """Compute hard-anchor support ratio for tests and debugging."""
     src = _positive_recall_text(reason)
     ratio, _ = _structural_support_ratio(src, assistant_text)
     return ratio
@@ -766,7 +741,7 @@ def _reason_claims_positive_recall(reason: str) -> bool:
 
 
 def _strip_verify_audit_notes(out: JudgeOutput) -> JudgeOutput:
-    """移除历史版本在 reason 末尾追加的「核对…」压分备注。"""
+    """Remove legacy score-suppression audit notes from a reason."""
     new_cps = []
     for cp in out.checkpoints:
         rsn = _REASON_AUDIT_NOTE_RE.sub("", str(cp.reason or "")).strip()
@@ -779,11 +754,10 @@ def _enforce_reason_supported_by_answer(
     task: TaskItem,
     assistant_text: str,
 ) -> JudgeOutput:
-    """
-    保留入口以兼容调用链；不再根据层 1/层 2 日期金额字面匹配压分。
+    """Preserve the call path without applying literal-anchor penalties.
 
-    纯字面核对无法覆盖中文月日、同义概括与 Judge 已给出的 GT 条数得分，
-    易与模型语义评判冲突，故仅由 Judge 在打分阶段自洽，后处理不改 score。
+    Literal matching cannot reliably handle localized dates, paraphrases, or
+    semantic GT scoring, so score consistency remains the Judge's job.
     """
     _ = (task, assistant_text)
     return _strip_verify_audit_notes(out)
@@ -792,7 +766,7 @@ def _enforce_reason_supported_by_answer(
 def _sync_rationale_from_scores(
     out: JudgeOutput, *, pass_threshold: float
 ) -> JudgeOutput:
-    """按校正后的 checkpoints/deductions 重写 rationale，避免与总分/通过态矛盾。"""
+    """Rewrite rationale from normalized scores to prevent contradictions."""
     earned = sum(float(c.score or 0) for c in out.checkpoints)
     deducted = sum(float(d.points or 0) for d in out.deductions)
     ts = float(out.total_score_0_100)
@@ -858,11 +832,7 @@ def _strip_positive_deduction_narrative(reason: str) -> str:
 
 
 def _finalize_zero_point_deduction_reason(reason: str) -> str:
-    """
-    points=0 时润色扣分原因：只去掉与分值矛盾的「扣 N 分/累计扣分」叙述，保留可审计说明。
-
-    不一律改成「未发现误召」——漏召、未触发、已检查无误等情形应保留或改用更准确模板。
-    """
+    """Remove point claims that contradict a zero-point deduction reason."""
     r = str(reason or "").strip()
     if _reason_claims_positive_deduction(r):
         r = _strip_positive_deduction_narrative(r)
@@ -884,7 +854,7 @@ def _finalize_zero_point_deduction_reason(reason: str) -> str:
 
 
 def _align_deduction_reason(reason: str, *, points: float) -> str:
-    """扣分原因与 points 对齐，避免「写了扣 6 分但 points=0」。"""
+    """Align deduction wording with its normalized points."""
     pts = float(points or 0)
     r = str(reason or "").strip()
     if abs(pts) <= 1e-9:
@@ -917,7 +887,7 @@ def _claimed_deduction_points_from_reason(reason: str) -> float | None:
 
 
 def _align_checkpoint_reason(reason: str, *, score: float, max_points: float) -> str:
-    """得分原因与 score 对齐。"""
+    """Align checkpoint wording with its normalized score."""
     r = str(reason or "").strip()
     if not r:
         return r
@@ -958,7 +928,7 @@ def _is_omission_like_reason(reason: str) -> bool:
 
 
 def _sanitize_memory_retrieval_score_reason(reason: str) -> str:
-    """记忆检索得分原因：去掉误召/漏召扣分侧表述，保留已召回/未召回 GT 叙述。"""
+    """Remove deduction-side language from retrieval score reasons."""
     r = str(reason or "").strip()
     if not r:
         return r
@@ -973,7 +943,7 @@ def _sanitize_memory_retrieval_score_reason(reason: str) -> str:
 
 
 def _sanitize_memory_retrieval_deduction_reason(reason: str, *, points: float) -> str:
-    """记忆检索扣分原因：只保留误召侧说明；遗漏类表述剔除或替换为未触发模板。"""
+    """Keep false-recall details and remove omission penalties."""
     r = str(reason or "").strip()
     pts = float(points or 0)
     if abs(pts) <= 1e-9:
@@ -990,7 +960,7 @@ def _sanitize_memory_retrieval_deduction_reason(reason: str, *, points: float) -
 
 
 def _polish_judge_reasons(out: JudgeOutput, task: TaskItem) -> JudgeOutput:
-    """按能力子项润色 reason 文案，强化得分/扣分原因分工及与分值一致。"""
+    """Polish reasons while preserving score and deduction separation."""
     score_rules = _score_rule_lines(task)
     ded_rules = _deduction_rule_per_slot(task)
 
@@ -1044,10 +1014,7 @@ def _grading_eval_guides_block(task: TaskItem) -> str:
 
 
 def _suppress_omission_double_penalty(out: JudgeOutput) -> JudgeOutput:
-    """
-    避免“漏召/未覆盖”在 checkpoints 失分后又在 deductions 重复扣分。
-    保留原因文本用于审计，但将这类 deduction 的 points 归零。
-    """
+    """Prevent omissions from being penalized in scores and deductions."""
     changed = False
     patched = []
     for d in out.deductions:
@@ -1064,6 +1031,7 @@ def _suppress_omission_double_penalty(out: JudgeOutput) -> JudgeOutput:
 
 
 JUDGE_MAX_ATTEMPTS = 3
+
 
 def _final_reply_max_chars() -> int:
     return config.judge_final_reply_max_chars()
@@ -1338,7 +1306,7 @@ def _run_judge_ensemble(
         report["partial_failures"] = failure_msgs
 
     logger.debug(
-        "Judge 汇总 task_id={} models_ok={}/{} mean_score={} aggregate_passed={}",
+        "Judge aggregate task_id={} models_ok={}/{} mean_score={} aggregate_passed={}",
         task.task_id,
         len(successes),
         len(models),
@@ -1361,7 +1329,7 @@ def _finalize_single_output(
     task_id: str = "",
     assistant_text: str = "",
 ) -> JudgeOutput:
-    """将模型给出的 total_score_0_100 校正为「总得分 − 总扣分」，并同步 passed。"""
+    """Normalize total score to earned points minus deductions."""
     raw = float(out.total_score_0_100)
     no_double = _suppress_omission_double_penalty(out)
     synced = _sync_max_points_from_criteria(no_double, task) if task is not None else no_double
@@ -1370,6 +1338,8 @@ def _finalize_single_output(
         if task is not None
         else synced
     )
+    if task is not None:
+        _validate_memory_retrieval_score_consistency(equal_weighted, task)
     verified = (
         _enforce_reason_supported_by_answer(equal_weighted, task, assistant_text)
         if task is not None and assistant_text.strip()
@@ -1383,7 +1353,7 @@ def _finalize_single_output(
     ts = float(synced_rationale.total_score_0_100)
     if abs(raw - ts) > 1e-4:
         logger.debug(
-            "Judge total_score_0_100 校正 task_id={} 模型输出={} -> 总得分-总扣分={}",
+            "Judge total_score_0_100 normalized task_id={} model_output={} computed={}",
             task_id or "?",
             raw,
             ts,
@@ -1403,7 +1373,7 @@ def _judge_one_model(
     for attempt in range(1, JUDGE_MAX_ATTEMPTS + 1):
         try:
             logger.debug(
-                "Judge 请求 task_id={} model={} attempt={}/{} pass_threshold={} prompt_len={}",
+                "Judge request task_id={} model={} attempt={}/{} pass_threshold={} prompt_len={}",
                 task.task_id,
                 model,
                 attempt,
@@ -1430,7 +1400,7 @@ def _judge_one_model(
             )
             _validate_output_rule_coverage(task, out)
             logger.debug(
-                "Judge 响应 task_id={} model={} attempt={}/{} total_score_0_100={} passed={}",
+                "Judge response task_id={} model={} attempt={}/{} total_score_0_100={} passed={}",
                 task.task_id,
                 model,
                 attempt,
@@ -1442,7 +1412,7 @@ def _judge_one_model(
         except Exception as e:
             last_err = str(e)
             logger.warning(
-                "Judge 模型失败 task_id={} model={} attempt={}/{} err={}",
+                "Judge model failed task_id={} model={} attempt={}/{} err={}",
                 task.task_id,
                 model,
                 attempt,
@@ -1459,10 +1429,11 @@ def run_judge(
     pass_threshold: float,
 ) -> JudgeEnsembleResult:
     """
-    按 config.judge_model_names() 列出的模型并行调用 Judge。
-    成功返回的模型分数取算术平均作为 total_score_0_100 汇总；
+    Run configured Judge models concurrently and use the arithmetic mean of
+    successful scores as ``total_score_0_100``.
     aggregate_passed = (mean >= pass_threshold * 100)。
-    单模型时行为与原先一致，report 结构仍含 aggregate / per_model 便于解析。
+    Single-model behavior is unchanged; the report retains aggregate and
+    per-model sections.
     """
     user_payload = _build_user_payload(task, turn, pass_threshold=pass_threshold)
     return _run_judge_ensemble(

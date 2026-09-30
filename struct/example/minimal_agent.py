@@ -61,7 +61,7 @@ def _read_queries(path: Path) -> Iterable[tuple[str, str]]:
             task_id = str(row.get("Query编号") or "").strip()
             query = str(row.get("Query") or "").strip()
             if not task_id or not query:
-                raise ValueError(f"Missing Query编号 or Query at {path}:{row_number}")
+                raise ValueError(f"Missing Query ID or Query at {path}:{row_number}")
             yield task_id, query
 
 

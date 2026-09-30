@@ -65,12 +65,11 @@ def _walk_ids(value: Any) -> Iterable[str]:
                 candidate = str(child).strip().lower()
                 if _EVIDENCE_ID_RE.fullmatch(candidate):
                     yield candidate
-            yield from _walk_ids(child)
+            elif isinstance(child, (dict, list)):
+                yield from _walk_ids(child)
     elif isinstance(value, list):
         for child in value:
             yield from _walk_ids(child)
-    elif isinstance(value, str):
-        yield from (match.group(0).lower() for match in _EVIDENCE_ID_RE.finditer(value))
 
 
 def _ids_from_tool_results(turn: ConversationTurn) -> set[str]:

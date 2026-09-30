@@ -70,7 +70,10 @@ def _parse_timestamp(
     for value in candidates:
         if isinstance(value, str) and value.strip():
             try:
-                return datetime.fromisoformat(value.strip().replace("Z", "+00:00"))
+                parsed = datetime.fromisoformat(value.strip().replace("Z", "+00:00"))
+                if parsed.tzinfo is None or parsed.utcoffset() is None:
+                    return parsed.replace(tzinfo=timezone.utc)
+                return parsed.astimezone(timezone.utc)
             except ValueError:
                 continue
         if isinstance(value, (int, float)):
@@ -121,30 +124,42 @@ def _parse_tool_arguments(raw: Any) -> dict[str, Any]:
 
 def _normalize_assistant_message(obj: dict[str, Any]) -> dict[str, Any]:
     content = obj.get("content")
-    if isinstance(content, list):
-        return dict(obj)
-
-    parts: list[dict[str, Any]] = []
-    reasoning = obj.get("reasoning_content")
-    if reasoning and str(reasoning).strip():
-        parts.append({"type": "thinking", "thinking": str(reasoning).strip()})
-    if content and str(content).strip():
-        parts.append({"type": "text", "text": str(content).strip()})
+    parts: list[dict[str, Any]] = (
+        [dict(part) for part in content if isinstance(part, dict)]
+        if isinstance(content, list)
+        else []
+    )
+    if not isinstance(content, list):
+        reasoning = obj.get("reasoning_content")
+        if reasoning and str(reasoning).strip():
+            parts.append({"type": "thinking", "thinking": str(reasoning).strip()})
+        if content and str(content).strip():
+            parts.append({"type": "text", "text": str(content).strip()})
+    existing_call_ids = {
+        str(part.get("id"))
+        for part in parts
+        if _content_part_kind(part) == "toolCall" and part.get("id")
+    }
     for tool_call in obj.get("tool_calls") or []:
         if not isinstance(tool_call, dict):
+            continue
+        tool_call_id = str(tool_call.get("id") or "")
+        if tool_call_id and tool_call_id in existing_call_ids:
             continue
         function = tool_call.get("function")
         function = function if isinstance(function, dict) else {}
         parts.append(
             {
                 "type": "toolCall",
-                "id": tool_call.get("id"),
+                "id": tool_call_id or None,
                 "name": str(function.get("name") or tool_call.get("name") or ""),
                 "arguments": _parse_tool_arguments(
                     function.get("arguments", tool_call.get("arguments"))
                 ),
             }
         )
+        if tool_call_id:
+            existing_call_ids.add(tool_call_id)
     message = {"role": "assistant", "content": parts}
     if isinstance(obj.get("usage"), dict):
         message["usage"] = obj["usage"]

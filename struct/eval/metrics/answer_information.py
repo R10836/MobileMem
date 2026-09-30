@@ -1,4 +1,4 @@
-"""基于 LLM 从参考答案与 Agent 最终回复抽取信息点并匹配，计算 recall / precision / F1。"""
+"""Use an LLM to extract answer facts and compute recall, precision, and F1."""
 
 from __future__ import annotations
 
@@ -108,8 +108,8 @@ def compute_tp_one_to_one(
     matches: List[Dict[str, Any]],
 ) -> Tuple[int, List[Dict[str, Any]]]:
     """
-    一对一贪心：按 gold_index 升序遍历 recalled 且 agent_index 合法的边；
-    同一 gold 或同一 agent 已占用则跳过（保留先出现的记录）。
+    Greedily keep valid recalled edges in ascending gold-index order. Skip an
+    edge when either endpoint is already used, preserving the first record.
     """
     cand = []
     for m in matches:
@@ -141,7 +141,7 @@ def compute_tp_one_to_one(
 
 def compute_metrics_from_llm_payload(data: Dict[str, Any]) -> Dict[str, Any]:
     """
-    对已解析的 LLM JSON 计算 TP / recall / precision / f1；用于单测与二次校验。
+    Compute TP, recall, precision, and F1 from parsed LLM JSON for validation.
     """
     gold_points = _coerce_str_list(data.get("gold_points", data.get("goldPoints")))
     agent_points = _coerce_str_list(data.get("agent_points", data.get("agentPoints")))
@@ -240,7 +240,8 @@ def run_answer_information_llm(
         },
     ]
     logger.debug(
-        "answer_recall LLM 请求 task_id={} model={} user_chars={} gold_chars={} agent_chars={}",
+        "answer_recall LLM request task_id={} model={} user_chars={} "
+        "gold_chars={} agent_chars={}",
         task_id,
         model,
         len((user_query or "").strip()),
@@ -255,12 +256,13 @@ def run_answer_information_llm(
     )
     data = parse_json_loose(raw)
     if not isinstance(data, dict):
-        raise ValueError(f"LLM 返回非 JSON 对象: {type(data).__name__}")
+        raise ValueError(f"LLM returned a non-object JSON value: {type(data).__name__}")
     out = compute_metrics_from_llm_payload(data)
     out["model"] = model
     out["llm_raw_keys"] = sorted(data.keys())
     logger.debug(
-        "answer_recall LLM 返回 task_id={} model={} R={} P={} F1={} tp={} gold_pts={} agent_pts={}",
+        "answer_recall LLM response task_id={} model={} R={} P={} F1={} "
+        "tp={} gold_pts={} agent_pts={}",
         task_id,
         model,
         out.get("recall"),
@@ -291,7 +293,7 @@ def _answer_info_one_model(
         )
         return model, out, None
     except Exception as e:
-        logger.warning("answer_recall 模型失败 task_id={} model={} err={}", task_id, model, e)
+        logger.warning("answer_recall model failed task_id={} model={} err={}", task_id, model, e)
         return model, None, str(e)
 
 
@@ -336,11 +338,11 @@ def answer_information_metrics_skipped(
     task_id: Optional[str] = None,
     error: Optional[str] = None,
 ) -> Dict[str, Any]:
-    """dry-run 或未配置 LLM 时占位，不调用 answer_information LLM。"""
+    """Return a placeholder during dry-run or without LLM configuration."""
     models = config.judge_model_names()
     out = _empty_shell(judge_models=models, skip_reason=skip_reason, error=error)
     if skip_reason == "dry_run":
-        logger.debug("answer_recall 跳过 task_id={} reason=dry_run", task_id)
+        logger.debug("answer_recall skipped task_id={} reason=dry_run", task_id)
     return out
 
 
@@ -352,17 +354,16 @@ def compute_answer_information_metrics(
     user_query: str = "",
 ) -> Dict[str, Any]:
     """
-    对单任务计算答案信息点指标；与 Judge 共用 ``config.judge_model_names()``，
-    多模型时并行调用并对 recall/precision/f1/tp 取算术平均。
-    final_answer：TaskItem.expected_behavior 中的标准答案。
-    user_query：用户任务/查询（通常为 TaskItem.prompt），用于约束仅抽取与查询相关的原子点。
+    Compute answer-information metrics for one task using the configured
+    Judge models. Multiple model results are averaged. ``final_answer`` is
+    the gold answer and ``user_query`` limits extraction to relevant facts.
     """
     models = config.judge_model_names()
     fa = (final_answer or "").strip()
     ag = (agent_answer or "").strip()
 
     if not fa:
-        logger.debug("answer_recall 跳过 task_id={} reason=no_gold_points", task_id)
+        logger.debug("answer_recall skipped task_id={} reason=no_gold_points", task_id)
         base = _empty_shell(judge_models=models, skip_reason="no_gold_points", error=None)
         base["gold_point_count"] = 0
         base["agent_point_count"] = 0
@@ -370,7 +371,7 @@ def compute_answer_information_metrics(
         return base
 
     if not ag:
-        logger.debug("answer_recall 跳过 task_id={} reason=no_agent_answer", task_id)
+        logger.debug("answer_recall skipped task_id={} reason=no_agent_answer", task_id)
         base = _empty_shell(judge_models=models, skip_reason="no_agent_answer", error=None)
         base["gold_point_count"] = None
         base["agent_point_count"] = 0
@@ -390,13 +391,13 @@ def compute_answer_information_metrics(
 
     if not config.llm_config_ready():
         logger.warning(
-            "answer_recall 跳过 task_id={} reason=llm_not_configured",
+            "answer_recall skipped task_id={} reason=llm_not_configured",
             task_id,
         )
         return _empty_shell(
             judge_models=models,
             skip_reason=None,
-            error="LLM 未配置：无法计算答案信息点指标（请设置 LLM_API_KEY、LLM_BASE_URL）",
+            error="LLM is not configured; set LLM_API_KEY and LLM_BASE_URL",
         )
 
     per_model_rows: List[Dict[str, Any]] = []
@@ -404,7 +405,8 @@ def compute_answer_information_metrics(
     failure_msgs: List[str] = []
     max_workers = min(len(models), config.judge_parallel_max_workers())
     logger.debug(
-        "answer_recall 执行开始 task_id={} models={} parallel_workers={} gold_chars={} agent_chars={}",
+        "answer_recall started task_id={} models={} parallel_workers={} "
+        "gold_chars={} agent_chars={}",
         task_id,
         ",".join(models),
         max_workers if len(models) > 1 else 1,
@@ -511,7 +513,7 @@ def compute_answer_information_metrics(
 
     if not successes:
         logger.warning(
-            "answer_recall 全部模型失败 task_id={} failures={}",
+            "answer_recall all models failed task_id={} failures={}",
             task_id,
             failure_msgs,
         )
@@ -539,7 +541,7 @@ def compute_answer_information_metrics(
             },
             "per_model": per_model_rows,
             "failure_errors": failure_msgs,
-            "error": "; ".join(failure_msgs) if failure_msgs else "所有模型调用均失败",
+            "error": "; ".join(failure_msgs) if failure_msgs else "All model calls failed",
         }
 
     recalls = [float(s["recall"]) for s in successes if s.get("recall") is not None]
@@ -568,7 +570,8 @@ def compute_answer_information_metrics(
     pairs_top = list(primary_row.get("matched_pairs") or [])
 
     logger.debug(
-        "answer_recall 聚合完成 task_id={} models_ok={}/{} mean_R={} mean_P={} mean_F1={} mean_tp={} "
+        "answer_recall aggregation completed task_id={} models_ok={}/{} "
+        "mean_R={} mean_P={} mean_F1={} mean_tp={} "
         "primary_model={}",
         task_id,
         len(successes),

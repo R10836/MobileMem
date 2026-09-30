@@ -63,8 +63,8 @@ class EvidencePreflightError(ValueError):
             f"{issue.task_id}:{issue.code}:{issue.message}" for issue in report.errors[:8]
         )
         if len(report.errors) > 8:
-            preview += f"；另有 {len(report.errors) - 8} 项"
-        super().__init__(f"证据前置校验失败（{len(report.errors)} 项）：{preview}")
+            preview += f"; plus {len(report.errors) - 8} more"
+        super().__init__(f"Evidence preflight failed ({len(report.errors)} issues): {preview}")
 
 
 @dataclass(frozen=True)
@@ -165,7 +165,7 @@ def _read_json(path: Path) -> Any:
     try:
         return json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as exc:
-        raise EvidenceCatalogError(f"无法读取证据文件 {path}: {exc}") from exc
+        raise EvidenceCatalogError(f"Cannot read evidence file {path}: {exc}") from exc
 
 
 def _canonical_json(value: Any) -> str:
@@ -187,7 +187,8 @@ def _add_entry(
         if _canonical_json(previous) == _canonical_json(entry):
             return
         raise EvidenceCatalogError(
-            f"evidence_id 内容冲突: {evidence_id}（{sources[evidence_id]} 与 {source}）"
+            f"Conflicting content for evidence_id {evidence_id}: "
+            f"{sources[evidence_id]} versus {source}"
         )
     by_id[evidence_id] = entry
     sources[evidence_id] = str(source.resolve())
@@ -208,13 +209,15 @@ def _load_array_source(
     elif isinstance(value, list):
         records = (item for item in value if isinstance(item, dict))
     else:
-        raise EvidenceCatalogError(f"证据文件顶层必须为数组: {path}")
+        raise EvidenceCatalogError(f"Evidence file must contain a top-level array: {path}")
     for record in records:
         evidence_id = _record_id(record)
         if evidence_id is None:
             if recursive:
                 continue
-            raise EvidenceCatalogError(f"证据记录缺少 12 位 id/evidence_id: {path}")
+            raise EvidenceCatalogError(
+                f"Evidence record lacks a 12-character id/evidence_id: {path}"
+            )
         data_type = str(record.get("data_type") or fallback_type).strip() or fallback_type
         _add_entry(
             by_id,
@@ -267,7 +270,10 @@ def load_active_evidence_index(root: Path) -> dict[str, Any]:
     if not root.is_dir():
         raise NotADirectoryError(str(root))
     if not is_active_evidence_root(root):
-        raise EvidenceCatalogError(f"不是活动证据目录（未找到六类 batch.json）: {root}")
+        raise EvidenceCatalogError(
+            "Not an active evidence directory; six required batch.json files "
+            f"were not found: {root}"
+        )
 
     candidate_paths = [
         root / relative
@@ -387,7 +393,7 @@ def validate_tasks_against_index(
 ) -> EvidencePreflightReport:
     by_id = index.get("by_evidence_id")
     if not isinstance(by_id, dict):
-        raise EvidenceCatalogError("活动证据目录缺少 by_evidence_id")
+        raise EvidenceCatalogError("Active evidence index lacks by_evidence_id")
     report = EvidencePreflightReport(
         evidence_root=str(Path(evidence_root).resolve()),
         task_count=len(tasks),
@@ -397,7 +403,11 @@ def validate_tasks_against_index(
         evidence_ids = [str(x).strip().lower() for x in (task.evidence_ids or []) if str(x).strip()]
         if len(evidence_ids) != len(set(evidence_ids)):
             report.errors.append(
-                EvidenceIssue(task.task_id, "duplicate_task_evidence_id", "题内 evidence_id 重复")
+                EvidenceIssue(
+                    task.task_id,
+                    "duplicate_task_evidence_id",
+                    "Duplicate evidence_id within task",
+                )
             )
         gt_count = _gt_count(task.metadata_gt or "")
         if gt_count != len(evidence_ids):
@@ -405,7 +415,7 @@ def validate_tasks_against_index(
                 EvidenceIssue(
                     task.task_id,
                     "gt_evidence_count_mismatch",
-                    f"GT 条目 {gt_count} 条，evidence_ids {len(evidence_ids)} 条",
+                    f"GT contains {gt_count} items but evidence_ids contains {len(evidence_ids)}",
                 )
             )
 
@@ -417,7 +427,7 @@ def validate_tasks_against_index(
                     EvidenceIssue(
                         task.task_id,
                         "missing_evidence_id",
-                        "活动证据目录中不存在该 ID",
+                        "ID does not exist in the active evidence directory",
                         evidence_id,
                     )
                 )
@@ -428,7 +438,7 @@ def validate_tasks_against_index(
                     EvidenceIssue(
                         task.task_id,
                         "invalid_evidence_record",
-                        "证据记录不是对象",
+                        "Evidence record is not an object",
                         evidence_id,
                     )
                 )
@@ -440,7 +450,7 @@ def validate_tasks_against_index(
                         EvidenceIssue(
                             task.task_id,
                             "created_at_unavailable",
-                            "Query 含当前时间，但证据没有可解析的 created_at",
+                            "Query has a current time but evidence has no parseable created_at",
                             evidence_id,
                         )
                     )
@@ -449,7 +459,8 @@ def validate_tasks_against_index(
                         EvidenceIssue(
                             task.task_id,
                             "evidence_not_visible_at_query_time",
-                            f"created_at={created.isoformat()} 晚于 Query 日 {query_date.isoformat()}",
+                            f"created_at={created.isoformat()} is later than "
+                            f"Query date {query_date.isoformat()}",
                             evidence_id,
                         )
                     )

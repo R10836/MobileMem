@@ -36,7 +36,7 @@ def parse_pass_threshold(value: Any, *, default: float = 0.8) -> float:
     if not match:
         raise ValueError(f"Invalid pass threshold: {value!r}")
     threshold = float(match.group(1))
-    if threshold > 1:
+    if "%" in text or "％" in text or threshold > 1:
         threshold /= 100
     if not 0 <= threshold <= 1:
         raise ValueError(f"Pass threshold must be between 0 and 1: {value!r}")
@@ -61,7 +61,7 @@ def _row_to_task(row: dict[str, str], *, source: Path, row_number: int) -> TaskI
     task_id = str(row.get("Query编号") or "").strip()
     prompt = str(row.get("Query") or "").strip()
     if not task_id:
-        raise ValueError(f"Missing Query编号 at {source}:{row_number}")
+        raise ValueError(f"Missing Query ID at {source}:{row_number}")
     if not prompt:
         raise ValueError(f"Missing Query at {source}:{row_number}")
 
@@ -108,7 +108,7 @@ def load_csv_tasks_document(path: Path) -> LoadedTasksDocument:
             task = _row_to_task(row, source=source, row_number=row_number)
             if task.task_id in seen:
                 raise ValueError(
-                    f"Duplicate Query编号 {task.task_id!r} at {source}:{row_number}"
+                    f"Duplicate Query ID {task.task_id!r} at {source}:{row_number}"
                 )
             seen.add(task.task_id)
             tasks.append(task)

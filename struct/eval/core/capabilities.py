@@ -1,4 +1,4 @@
-"""从 grading_criteria 解析「能力=」子项，并按 Judge checkpoints/deductions 汇总均分。"""
+"""Parse capability items and aggregate Judge checkpoints and deductions."""
 
 from __future__ import annotations
 
@@ -9,7 +9,8 @@ from typing import Any, DefaultDict, Dict, List, Optional, Tuple
 _CAPABILITY_RE = re.compile(r"能力\s*=\s*([^；;\n]+)")
 _SCORE_MAX_POINTS_RE = re.compile(r"分值\s*=\s*(\d+(?:\.\d+)?)")
 _DEDUCTION_MAX_POINTS_RE = re.compile(r"扣分\s*=\s*(\d+(?:\.\d+)?)")
-# 同条细则内附加档位「按 N/处」（不含主档 扣分=N/处）；说明性「逐条扣分细则」之后不计
+# Match an additional per-item tier in the same rule, excluding its primary
+# tier and any explanatory detail that follows the per-item section.
 _DEDUCTION_PER_ITEM_RE = re.compile(r"按\s*\d+(?:\.\d+)?\s*/\s*处")
 _DEDUCTION_PER_ITEM_VALUE_RE = re.compile(r"按\s*(\d+(?:\.\d+)?)\s*/\s*处")
 _EXPLICIT_DEDUCTION_CAP_RE = re.compile(
@@ -17,13 +18,13 @@ _EXPLICIT_DEDUCTION_CAP_RE = re.compile(
 )
 
 _UNLABELED_CAPABILITY = "未标注能力"
-# 汇总时将记忆检索 + 推理/聚合合并展示为「检索问答」
+# Merge retrieval and reasoning/aggregation into one display capability.
 _DISPLAY_RETRIEVAL_QA_CAPABILITY = "检索问答"
 _MERGE_TO_RETRIEVAL_QA_SOURCE = frozenset({"记忆检索", "推理/聚合"})
 
 
 def normalize_capability_name(capability: str) -> str:
-    """能力子项名归一化（去空白、统一斜杠），用于匹配与汇总。"""
+    """Normalize whitespace and slash variants for matching and aggregation."""
     s = str(capability or "").strip().replace("／", "/")
     return re.sub(r"\s+", "", s)
 
@@ -34,7 +35,7 @@ _MERGE_TO_RETRIEVAL_QA_NORMALIZED = frozenset(
 
 
 def display_capability(capability: str) -> str:
-    """能力汇总展示名：记忆检索、推理/聚合合并为检索问答。"""
+    """Return the display name used in capability summaries."""
     if normalize_capability_name(capability) in _MERGE_TO_RETRIEVAL_QA_NORMALIZED:
         return _DISPLAY_RETRIEVAL_QA_CAPABILITY
     return str(capability or "").strip() or _UNLABELED_CAPABILITY
@@ -59,12 +60,11 @@ _CIRCLED_SPLIT = re.compile(
 
 
 def split_rule_line_fragments(line: str) -> list[str]:
-    """
-    将一行细则按圈号切开，并把正文内的 ②③ 步骤引用合并回上一条含「能力=」的细则。
+    """Split one rule line at circled labels.
 
-    支持两种写法：
-    - 一行一条：① 能力=…；分值=… 描述中引用同程①②③步骤
-    - 一行多条：① 能力=A … ② 能力=B …（仅当各段均含「能力=」时拆成多条）
+    A circled label starts a new rule only when its fragment contains a
+    capability declaration. Otherwise it is treated as a step reference in
+    the preceding rule.
     """
     line = str(line or "").strip()
     if not line:
@@ -100,7 +100,7 @@ def _normalize_rule_chunk(chunk: str) -> str:
 
 
 def _extract_rule_lines(section_text: str) -> list[str]:
-    """从得分/扣分章节拆出逐条规则（支持单行内 ①②③ 多条，或正文内步骤引用）。"""
+    """Extract individual rules from score or deduction sections."""
     s = str(section_text or "").strip()
     if not s:
         return []
@@ -132,10 +132,7 @@ def score_rule_capabilities(grading_criteria: str) -> List[str]:
 
 
 def _deduction_capability_slots(line: str) -> int:
-    """
-    单条扣分细则对应 Judge deduction 条数。
-    含主「扣分=」且另有「按 N/处」附加档位时，与 LLM 拆条对齐（各档同一能力子项）。
-    """
+    """Return the number of Judge deductions represented by one rule."""
     if not str(line or "").strip():
         return 0
     if not _DEDUCTION_MAX_POINTS_RE.search(line):
@@ -147,7 +144,7 @@ def _deduction_capability_slots(line: str) -> int:
 
 
 def _collapse_consecutive_capabilities(caps: List[str]) -> List[str]:
-    """合并连续相同能力槽（细则多档、Judge 合并为一条时）。"""
+    """Collapse consecutive duplicate capability slots."""
     out: List[str] = []
     for cap in caps:
         if not out or cap != out[-1]:
@@ -168,9 +165,7 @@ def deduction_capabilities_for_judge_items(
     grading_criteria: str,
     deductions: List[Dict[str, Any]],
 ) -> List[str]:
-    """
-    与 Judge deductions 条数对齐的能力列表（展开多档 / 必要时合并连续同能力）。
-    """
+    """Align capability labels with the Judge deduction list."""
     expanded = deduction_rule_capabilities(grading_criteria)
     n = len(deductions)
     if n == len(expanded):
@@ -200,9 +195,7 @@ def max_points_from_deduction_rule(line: str) -> float:
 def synthetic_zero_capability_judge_items(
     grading_criteria: str,
 ) -> Tuple[List[Dict[str, float]], List[Dict[str, Any]]]:
-    """
-    提取文本为空等无 LLM 检查点明细时：按 grading_criteria 每条规则合成 score=0 / points=0。
-    """
+    """Create zero-valued Judge items when no LLM details are available."""
     checkpoints: List[Dict[str, float]] = []
     for line in score_rule_lines(grading_criteria):
         mx = max_points_from_score_rule(line)
@@ -248,7 +241,7 @@ def judge_items_for_capability_stats(
     report_task: Dict[str, Any],
     judge: Optional[Dict[str, Any]],
 ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
-    """返回用于能力子项汇总的 checkpoints / deductions（必要时按标准合成 0 分）。"""
+    """Return Judge items used for capability-level aggregation."""
     criteria = str(report_task.get("grading_criteria") or "")
     syn_cps, syn_deds = synthetic_zero_capability_judge_items(criteria)
 
@@ -298,7 +291,7 @@ def _per_task_capability_score_deduction(
     deductions: List[Dict[str, Any]],
     criteria: str,
 ) -> Tuple[Dict[str, float], Dict[str, float], Dict[str, float]]:
-    """单用例内按能力子项汇总：实得分、得分上限（仅得分细则）、实扣分。"""
+    """Aggregate earned, maximum, and deducted points by capability."""
     score_caps = score_rule_capabilities(criteria)
     ded_caps = deduction_capabilities_for_judge_items(criteria, deductions)
     earned: DefaultDict[str, float] = defaultdict(float)
@@ -324,7 +317,7 @@ def _per_task_capability_score_deduction(
 
 
 class CapabilityItemStatsAccumulator:
-    """按能力子项累计得分检查点与扣分条。"""
+    """Accumulate checkpoint and deduction statistics by capability."""
 
     def __init__(self) -> None:
         self._score_sum: DefaultDict[str, float] = defaultdict(float)
@@ -339,7 +332,7 @@ class CapabilityItemStatsAccumulator:
         self._ded_uncapped_n: DefaultDict[str, int] = defaultdict(int)
         self._rule_ded_n: DefaultDict[str, int] = defaultdict(int)
         self._all_capabilities: set[str] = set()
-        # (单用例净得分, 单用例得分上限, 该用例细则涉及的能力子项)
+        # Per-case net score, maximum score, and involved capabilities.
         self._per_task_composite: List[
             Tuple[Dict[str, float], Dict[str, float], set[str]]
         ] = []
@@ -434,6 +427,7 @@ class CapabilityItemStatsAccumulator:
             ),
             "capability_subitem_count": len(self._all_capabilities),
         }
+
 
 def _finalize_score_buckets(
     sum_score: Dict[str, float],

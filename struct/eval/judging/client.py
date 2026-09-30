@@ -1,4 +1,4 @@
-"""OpenAI 兼容 Chat Completions HTTP 客户端。"""
+"""OpenAI-compatible Chat Completions HTTP client."""
 
 from __future__ import annotations
 
@@ -13,6 +13,7 @@ from loguru import logger
 
 from eval import config
 
+
 def chat_completion_for_model(
     messages: list[dict[str, str]],
     *,
@@ -21,10 +22,10 @@ def chat_completion_for_model(
     response_format_json: bool | None = None,
 ) -> str:
     if not config.LLM_BASE_URL:
-        raise RuntimeError("LLM_BASE_URL 未配置")
+        raise RuntimeError("LLM_BASE_URL is not configured")
     if not config.LLM_API_KEY or config.LLM_API_KEY == "YOUR_API_KEY":
         raise RuntimeError(
-            "LLM_API_KEY 未配置或为占位符 YOUR_API_KEY，请设置环境变量 LLM_API_KEY"
+            "LLM_API_KEY is missing or still set to YOUR_API_KEY"
         )
 
     url = config.LLM_BASE_URL.rstrip("/") + "/chat/completions"
@@ -58,11 +59,11 @@ def chat_completion_for_model(
 
             choices = data.get("choices") or []
             if not choices:
-                raise RuntimeError(f"LLM 响应无 choices: {data!r}")
+                raise RuntimeError(f"LLM response has no choices: {data!r}")
             msg = choices[0].get("message") or {}
             content = msg.get("content")
             if not content:
-                raise RuntimeError(f"LLM 响应无 content: {data!r}")
+                raise RuntimeError(f"LLM response has no content: {data!r}")
             return content if isinstance(content, str) else str(content)
         except (httpx.HTTPError, json.JSONDecodeError) as e:
             n = attempt + 1
@@ -76,7 +77,7 @@ def chat_completion_for_model(
                 detail = ""
             if attempt >= max_retries:
                 logger.error(
-                    "LLM 请求失败已达最大重试: 第 {}/{} 次 model={} error={!r}{}",
+                    "LLM request reached the retry limit: attempt {}/{} model={} error={!r}{}",
                     n,
                     total,
                     model,
@@ -85,7 +86,7 @@ def chat_completion_for_model(
                 )
                 raise
             logger.warning(
-                "LLM 请求失败: 第 {}/{} 次 model={} error={!r}{}，{}s 后重试",
+                "LLM request failed: attempt {}/{} model={} error={!r}{}; retrying in {}s",
                 n,
                 total,
                 model,
@@ -101,7 +102,7 @@ def chat_completion(
     temperature: float = 0.2,
     response_format_json: bool | None = None,
 ) -> str:
-    """使用默认 LLM_MODEL 调用（兼容旧代码）。"""
+    """Call the default LLM_MODEL for backward compatibility."""
     return chat_completion_for_model(
         messages,
         model=config.LLM_MODEL,
@@ -112,8 +113,9 @@ def chat_completion(
 
 def _safe_eval_integer_arithmetic(expr: str) -> int | None:
     """
-    将 LLM 输出的「表达式」算为整数（如 total_score_0_100: 40 + 10 - 10）。
-    仅允许数字与 + - * / 括号及空格，避免 eval 注入。
+    Evaluate an arithmetic expression emitted by the LLM, such as
+    ``total_score_0_100: 40 + 10 - 10``. Only numbers, operators,
+    parentheses, and whitespace are accepted to prevent code injection.
     """
     s = expr.strip().rstrip(",")
     if not s or s.startswith('"'):
@@ -136,7 +138,7 @@ def _safe_eval_integer_arithmetic(expr: str) -> int | None:
 
 
 def _fix_total_score_arithmetic_in_json_text(text: str) -> str:
-    """把非法 JSON 的 \"total_score_0_100\": 40 + 10 - ... 改为数值字面量。"""
+    """Replace an arithmetic total_score expression with a JSON number."""
 
     def repl(m: re.Match[str]) -> str:
         prefix, raw = m.group(1), m.group(2).strip()
@@ -153,7 +155,7 @@ def _fix_total_score_arithmetic_in_json_text(text: str) -> str:
 
 
 def _repair_json_text_loose(text: str) -> str:
-    """去除尾逗号、截取首个完整 JSON 对象，供 LLM 输出容错。"""
+    """Remove trailing commas and extract the first complete JSON object."""
     s = (text or "").strip()
     if not s:
         return s

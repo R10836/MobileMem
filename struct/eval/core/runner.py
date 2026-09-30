@@ -1,4 +1,4 @@
-"""单条 / 批量 / dry-run 编排。"""
+"""Orchestrate single-case, batch, and dry-run evaluation."""
 
 from __future__ import annotations
 
@@ -49,15 +49,15 @@ def _format_batch_task_progress(
 ) -> str:
     if row.get("skipped") is True:
         errors = row.get("errors") or []
-        detail = str(errors[0]) if errors else str(row.get("match_status") or "未知原因")
+        detail = str(errors[0]) if errors else str(row.get("match_status") or "unknown reason")
         if len(detail) > 60:
             detail = detail[:57] + "..."
-        return f"[{index}/{total}] {task_id} 跳过 | {detail}"
+        return f"[{index}/{total}] {task_id} skipped | {detail}"
     score = row.get("total_score_0_100")
     if score is None:
-        return f"[{index}/{total}] {task_id} 完成"
-    result = "通过" if row.get("passed") is True else "未通过"
-    return f"[{index}/{total}] {task_id} 完成 | {float(score):.2f} 分 | {result}"
+        return f"[{index}/{total}] {task_id} completed"
+    result = "passed" if row.get("passed") is True else "failed"
+    return f"[{index}/{total}] {task_id} completed | {float(score):.2f} | {result}"
 
 
 def _print_batch_progress(message: str) -> None:
@@ -89,7 +89,8 @@ def _session_getter_for_bases(bases: List[Path]):
             n_all = len(sess.turns)
             n_biz = len(sess.business_turns())
             logger.info(
-                "日志解析完成 path={} spec={!r} session_id={} 全量交互轮次={} 业务向交互轮次={} 来源jsonl文件数={}",
+                "Trace parsed path={} spec={!r} session_id={} all_turns={} "
+                "business_turns={} source_jsonl_files={}",
                 p,
                 spec,
                 sess.session_id,
@@ -98,13 +99,14 @@ def _session_getter_for_bases(bases: List[Path]):
                 len(sess.source_paths or []),
             )
         else:
-            logger.debug("复用已加载会话: {}", key)
+            logger.debug("Reusing loaded session: {}", key)
         return session_cache[key]
 
     return get_session, resolve_spec
 
 
 _TASK_EVAL_FINGERPRINT_VERSION = "v2"
+_LOG_CONTENT_FINGERPRINT_VERSION = "v1"
 
 
 def _normalized_optional_text(value: Any) -> Optional[str]:
@@ -144,6 +146,23 @@ def task_eval_fingerprint(task: TaskItem) -> str:
     return f"{_TASK_EVAL_FINGERPRINT_VERSION}:{digest}"
 
 
+def log_content_fingerprint(source_paths: Optional[List[str]]) -> str:
+    """Hash the exact trace files used to build a parsed session."""
+    paths = sorted(
+        {Path(value).expanduser().resolve() for value in (source_paths or [])},
+        key=lambda path: str(path),
+    )
+    digest = hashlib.sha256()
+    for path in paths:
+        path_bytes = str(path).encode("utf-8")
+        content = path.read_bytes()
+        digest.update(len(path_bytes).to_bytes(8, "big"))
+        digest.update(path_bytes)
+        digest.update(len(content).to_bytes(8, "big"))
+        digest.update(content)
+    return f"{_LOG_CONTENT_FINGERPRINT_VERSION}:{digest.hexdigest()}"
+
+
 def row_eval_fingerprint(row: Dict[str, Any]) -> str:
     """Return only current-version fingerprints; legacy prompt hashes expire."""
     stored = row.get("task_eval_fingerprint")
@@ -161,7 +180,7 @@ def row_eval_content_matches_task(row: Dict[str, Any], task: TaskItem) -> bool:
 
 
 def _merge_checkpoint_row_with_task(row: Dict[str, Any], task: TaskItem) -> Dict[str, Any]:
-    """保留 Judge/匹配等评测结果，同步当前任务元数据（含 task_id）。"""
+    """Preserve evaluation results while refreshing current task metadata."""
     out = copy.deepcopy(row)
     out.update(task_fields_public(task))
     return out
@@ -242,7 +261,7 @@ def run_dry_run(
     tasks_path = Path(tasks_path)
     loaded = load_tasks_document(tasks_path)
     logger.info(
-        "已加载评测任务条数={} (任务文件格式={})",
+        "Loaded {} evaluation tasks (format={})",
         len(loaded.tasks),
         loaded.format,
     )
@@ -254,7 +273,7 @@ def run_dry_run(
     )
     idx_uid_dr = resolve_index_user_id(tasks_path)
     logger.info(
-        "证据召回配置: benchmark_data_root={} index_user_id={}",
+        "Evidence recall configuration: benchmark_data_root={} index_user_id={}",
         str(er_root_dr.resolve()) if er_root_dr else None,
         idx_uid_dr,
     )
@@ -267,7 +286,8 @@ def run_dry_run(
     default_target = resolve_spec(default_spec)
     default_session = get_session(default_spec)
     logger.info(
-        "dry-run 默认日志 spec={!r} -> {} 解析基目录={} | 默认会话汇总: 全量交互轮次={} 业务向交互轮次={}",
+        "dry-run default trace spec={!r} -> {} bases={} | session: "
+        "all_turns={} business_turns={}",
         default_spec,
         default_target,
         [str(b) for b in bases],
@@ -275,7 +295,7 @@ def run_dry_run(
         len(default_session.business_turns()),
     )
     logger.info(
-        "dry-run 指标开关: evidence_recall={} answer_information_metrics={}",
+        "dry-run metric flags: evidence_recall={} answer_information_metrics={}",
         with_evidence_recall,
         with_answer_information_metrics,
     )
@@ -287,7 +307,7 @@ def run_dry_run(
         session = get_session(spec)
         m = match_task_to_session(task, session)
         logger.debug(
-            "dry-run 匹配 task_id={} status={} biz_turn_idx={}",
+            "dry-run match task_id={} status={} business_turn_index={}",
             task.task_id,
             m.status,
             m.business_turn_index,
@@ -356,7 +376,7 @@ def run_dry_run(
     n_skip = sum(1 for r in rows if r["status"] == "skipped")
     n_err = sum(1 for r in rows if r["status"] == "error")
     logger.info(
-        "dry-run 完成: 任务数={} 匹配成功={} 跳过={} 错误={}",
+        "dry-run completed: tasks={} matched={} skipped={} errors={}",
         len(rows),
         n_ok,
         n_skip,
@@ -366,51 +386,56 @@ def run_dry_run(
 
 
 def _extended_metrics_log_fragment(base: Dict[str, Any]) -> str:
-    """工具有效性 / 证据召回 / 答案信息点 单行摘要（供 DEBUG 详细日志）。"""
+    """Build a one-line debug summary of optional metrics."""
     chunks: List[str] = []
     tue = base.get("tool_use_effectiveness")
     if tue is None:
-        chunks.append("工具有效性=未计算")
+        chunks.append("tool_effectiveness=not_computed")
     elif isinstance(tue, dict):
         err = tue.get("error")
         if err:
             err_s = str(err).replace("\n", " ")
-            chunks.append(f"工具有效性=失败({err_s[:120]}{'…' if len(err_s) > 120 else ''})")
+            suffix = "..." if len(err_s) > 120 else ""
+            chunks.append(f"tool_effectiveness=failed({err_s[:120]}{suffix})")
         else:
             ratio = tue.get("effective_tool_ratio")
             tot = tue.get("tool_call_total")
             eff = tue.get("tool_call_effective")
             llm_n = tue.get("llm_judged_count")
             rule_n = tue.get("rule_invalid_count")
-            chunks.append(f"工具有效性=ratio={ratio} effective={eff}/{tot} rule_invalid={rule_n} llm_judged={llm_n}")
+            chunks.append(
+                f"tool_effectiveness=ratio={ratio} effective={eff}/{tot} "
+                f"rule_invalid={rule_n} llm_judged={llm_n}"
+            )
     else:
-        chunks.append("工具有效性=?")
+        chunks.append("tool_effectiveness=?")
 
     er = base.get("evidence_recall")
     if not isinstance(er, dict):
-        chunks.append("证据召回=-")
+        chunks.append("evidence_recall=-")
     elif er.get("skipped") or er.get("skip_reason") == "disabled":
-        chunks.append("证据召回=关闭")
+        chunks.append("evidence_recall=disabled")
     else:
         rec = er.get("recall")
         hit = er.get("hit_count")
         gold = er.get("gold_total")
-        chunks.append(f"证据召回=recall={rec} hit={hit}/{gold}")
+        chunks.append(f"evidence_recall=recall={rec} hit={hit}/{gold}")
 
     aim = base.get("answer_information_metrics")
     if aim is None or not isinstance(aim, dict):
-        chunks.append("答案信息点=未启用")
+        chunks.append("answer_information=disabled")
     else:
         err = aim.get("error")
         sr = aim.get("skip_reason")
         if err:
             es = str(err).replace("\n", " ")
-            chunks.append(f"答案信息点=失败({es[:100]}{'…' if len(es) > 100 else ''})")
+            suffix = "..." if len(es) > 100 else ""
+            chunks.append(f"answer_information=failed({es[:100]}{suffix})")
         elif sr:
-            chunks.append(f"答案信息点=跳过({sr})")
+            chunks.append(f"answer_information=skipped({sr})")
         else:
             chunks.append(
-                "答案信息点="
+                "answer_information="
                 f"R={aim.get('recall')} P={aim.get('precision')} F1={aim.get('f1')} tp={aim.get('tp')}"
             )
     return " | ".join(chunks)
@@ -500,7 +525,7 @@ def _eval_one_task(
     task_total: Optional[int] = None,
 ) -> Dict[str, Any]:
     m = match_task_to_session(task, session)
-    logger.debug("评测匹配 task_id={} -> {}", task.task_id, m.status)
+    logger.debug("Evaluation match task_id={} -> {}", task.task_id, m.status)
     base: Dict[str, Any] = {
         **task_fields_public(task),
         "match_status": m.status,
@@ -522,7 +547,7 @@ def _eval_one_task(
         base["tool_efficiency"] = None
         base["tool_use_effectiveness"] = None
         logger.warning(
-            "任务跳过 task_id={} 原因=匹配失败 status={} warnings={}",
+            "Task skipped task_id={} reason=match_failed status={} warnings={}",
             task.task_id,
             m.status,
             m.warnings,
@@ -543,7 +568,7 @@ def _eval_one_task(
             with_answer_information_metrics=with_answer_information_metrics,
         )
         logger.debug(
-            "评测扩展指标 task_id={} match_status={} skipped={} | {}",
+            "Evaluation metrics task_id={} match_status={} skipped={} | {}",
             task.task_id,
             m.status,
             base.get("skipped"),
@@ -575,16 +600,16 @@ def _eval_one_task(
             dry_run=True,
         )
         logger.debug(
-            "dry-run 扩展指标 task_id={} | {}",
+            "dry-run metrics task_id={} | {}",
             task.task_id,
             _extended_metrics_log_fragment(base),
         )
         return base
 
     if not config.llm_config_ready():
-        logger.warning("任务跳过 task_id={} 原因=LLM 未配置", task.task_id)
+        logger.warning("Task skipped task_id={} reason=LLM_not_configured", task.task_id)
         base["errors"].append(
-            "LLM 未配置：请设置环境变量 LLM_API_KEY（及可选 LLM_BASE_URL、LLM_MODEL）"
+            "LLM is not configured; set LLM_API_KEY and optionally LLM_BASE_URL and LLM_MODEL"
         )
         base["skipped"] = True
         base["total_score_0_100"] = None
@@ -608,7 +633,7 @@ def _eval_one_task(
             with_answer_information_metrics=with_answer_information_metrics,
         )
         logger.debug(
-            "评测扩展指标 task_id={} match_status={} skipped={} | {}",
+            "Evaluation metrics task_id={} match_status={} skipped={} | {}",
             task.task_id,
             m.status,
             base.get("skipped"),
@@ -619,7 +644,7 @@ def _eval_one_task(
     try:
         ens = run_judge(task, m.turn, pass_threshold=task.pass_threshold)
     except Exception as e:
-        logger.exception("Judge 失败 task_id={}", task.task_id)
+        logger.exception("Judge failed task_id={}", task.task_id)
         base["errors"].append(str(e))
         base["skipped"] = True
         base["total_score_0_100"] = None
@@ -643,7 +668,7 @@ def _eval_one_task(
             with_answer_information_metrics=with_answer_information_metrics,
         )
         logger.debug(
-            "评测扩展指标 task_id={} match_status={} skipped={} | {}",
+            "Evaluation metrics task_id={} match_status={} skipped={} | {}",
             task.task_id,
             m.status,
             base.get("skipped"),
@@ -652,7 +677,7 @@ def _eval_one_task(
         return base
 
     if not ens.ok:
-        errs = ens.report.get("failure_errors") or ["所有 Judge 模型调用均失败"]
+        errs = ens.report.get("failure_errors") or ["All Judge model calls failed"]
         if isinstance(errs, list):
             base["errors"].extend(errs)
         else:
@@ -679,7 +704,7 @@ def _eval_one_task(
             with_answer_information_metrics=with_answer_information_metrics,
         )
         logger.debug(
-            "评测扩展指标 task_id={} match_status={} skipped={} | {}",
+            "Evaluation metrics task_id={} match_status={} skipped={} | {}",
             task.task_id,
             m.status,
             base.get("skipped"),
@@ -696,7 +721,7 @@ def _eval_one_task(
         try:
             tue = compute_tool_use_effectiveness(m.turn, task)
         except Exception as e:
-            logger.warning("tool_effectiveness 失败 task_id={} err={}", task.task_id, e)
+            logger.warning("tool_effectiveness failed task_id={} err={}", task.task_id, e)
             tue = {
                 "error": str(e),
                 "effective_tool_ratio": None,
@@ -728,14 +753,14 @@ def _eval_one_task(
         with_answer_information_metrics=with_answer_information_metrics,
     )
     logger.info(
-        "任务完成{} task_id={} mean_score={} aggregate_passed={}",
+        "Task completed{} task_id={} mean_score={} aggregate_passed={}",
         f" [{task_index}/{task_total}]" if task_index is not None and task_total is not None else "",
         task.task_id,
         mean_score,
         agg_passed,
     )
     logger.debug(
-        "任务扩展指标 task_id={} | {}",
+        "Task metrics task_id={} | {}",
         task.task_id,
         _extended_metrics_log_fragment(base),
     )
@@ -750,7 +775,7 @@ def _row_needs_metric_refresh(
     with_evidence_recall: bool,
     with_answer_information_metrics: bool,
 ) -> bool:
-    """当前 run 启用的可选指标在检查点行中是否缺失（需补算而非整行跳过）。"""
+    """Return whether enabled optional metrics are absent from a checkpoint."""
     if with_answer_information_metrics and "answer_information_metrics" not in row:
         return True
     if with_evidence_recall and "evidence_recall" not in row:
@@ -771,7 +796,7 @@ def _row_needs_metric_refresh(
 
 
 def _row_has_completed_judge(row: Dict[str, Any]) -> bool:
-    """检查点行是否已有可复用的 Judge 结果（断点补算指标时不得清空）。"""
+    """Return whether a checkpoint contains a reusable Judge result."""
     if row.get("skipped"):
         return False
     if row.get("total_score_0_100") is None:
@@ -783,7 +808,7 @@ def _row_has_completed_judge(row: Dict[str, Any]) -> bool:
 
 
 def _resolve_row_eval_log_spec(row: Dict[str, Any], task: TaskItem, default_spec: str) -> str:
-    """补算指标时：优先用检查点行内 eval_log_spec（该题 Judge 所依日志）。"""
+    """Select the original per-task trace when backfilling metrics."""
     for cand in (row.get("eval_log_spec"), task.session_log, default_spec):
         if cand and str(cand).strip():
             return str(cand).strip()
@@ -805,16 +830,17 @@ def _warn_row_eval_log_spec_vs_default(
     default_spec: str,
     resolve_spec,
 ) -> None:
-    """行内 eval_log_spec 与本次 --log 不一致时告警（不阻断续跑）。"""
+    """Warn when a row trace differs from ``--log`` without blocking resume."""
     row_spec = str(row.get("eval_log_spec") or "").strip()
     if not row_spec:
         return
     if _log_spec_paths_equivalent(row_spec, default_spec, resolve_spec):
         return
     logger.warning(
-        "batch 检查点 task_id={} 行内 eval_log_spec={!r} 与本次 --log={!r} 路径不一致；"
-        "补算可选指标将使用行内日志。若需续跑整份检查点，请使 --log 与生成该 JSON 时一致，"
-        "且各任务 eval_log_spec 通常应与顶层 log_path_spec 相同（除非任务单独指定 session_log）",
+        "Batch checkpoint task_id={} has eval_log_spec={!r}, which differs from --log={!r}; "
+        "optional metrics will use the row trace. To resume the full checkpoint, use the trace "
+        "that created the JSON. Per-task eval_log_spec should normally match top-level "
+        "log_path_spec unless the task defines session_log.",
         task.task_id,
         row_spec,
         default_spec,
@@ -836,7 +862,7 @@ def _patch_optional_metrics_on_row(
     evidence_fuzzy_threshold: float,
     with_answer_information_metrics: bool,
 ) -> None:
-    """仅补算可选指标，不改动 judge / total_score / skipped。"""
+    """Backfill optional metrics without changing Judge results or status."""
     if dry_run:
         out["tool_efficiency"] = None
         out["tool_use_effectiveness"] = None
@@ -888,7 +914,11 @@ def _patch_optional_metrics_on_row(
         try:
             out["tool_use_effectiveness"] = compute_tool_use_effectiveness(turn, task)
         except Exception as e:
-            logger.warning("tool_effectiveness 检查点补算失败 task_id={} err={}", task.task_id, e)
+            logger.warning(
+                "tool_effectiveness checkpoint backfill failed task_id={} err={}",
+                task.task_id,
+                e,
+            )
             out["tool_use_effectiveness"] = {
                 "error": str(e),
                 "effective_tool_ratio": None,
@@ -933,9 +963,9 @@ def _refresh_row_optional_metrics(
     with_answer_information_metrics: bool,
 ) -> Dict[str, Any]:
     """
-    在检查点行上补算新增的可选指标（不重跑 Judge）。
-    已有 Judge 时：日志重匹配失败也保留原结果，仅更新可补算指标。
-    无 Judge 时：匹配失败才回退整任务重评。
+    Backfill new optional metrics without rerunning the Judge.
+    Preserve an existing Judge result even if trace rematching fails. Without
+    a Judge result, rematch failure falls back to full task evaluation.
     """
     row = _merge_checkpoint_row_with_task(row, task)
     spec = _resolve_row_eval_log_spec(row, task, default_spec)
@@ -959,7 +989,7 @@ def _refresh_row_optional_metrics(
             out["agent_processing_seconds"] = m.turn.agent_processing_duration_seconds()
         else:
             logger.debug(
-                "batch 检查点补算保留已有 Judge task_id={} log={!r} rematch={}",
+                "Batch checkpoint backfill preserved Judge task_id={} log={!r} rematch={}",
                 task.task_id,
                 spec,
                 m.status,
@@ -982,7 +1012,7 @@ def _refresh_row_optional_metrics(
         out["eval_log_target"] = str(resolve_spec(spec))
         out["eval_source_files"] = session.source_paths or []
         logger.info(
-            "batch 检查点已补算新增指标(保留Judge) task_id={} | {}",
+            "Batch checkpoint metrics backfilled with Judge preserved task_id={} | {}",
             task.task_id,
             _extended_metrics_log_fragment(out),
         )
@@ -990,7 +1020,11 @@ def _refresh_row_optional_metrics(
 
     m = match_task_to_session(task, session)
     if m.status != "ok" or m.turn is None:
-        logger.info("batch 检查点补算回退为全量重评 task_id={} reason=match_not_ok", task.task_id)
+        logger.info(
+            "Batch checkpoint backfill fell back to full evaluation "
+            "task_id={} reason=match_not_ok",
+            task.task_id,
+        )
         out = _eval_one_task(
             task,
             session,
@@ -1011,7 +1045,7 @@ def _refresh_row_optional_metrics(
 
     if not row_eval_content_matches_task(row, task):
         logger.warning(
-            "batch 检查点行与当前用例内容不一致，全量重评 task_id={}",
+            "Batch checkpoint row differs from current case; rerunning task_id={}",
             task.task_id,
         )
         out = _eval_one_task(
@@ -1060,7 +1094,7 @@ def _refresh_row_optional_metrics(
     out["eval_log_target"] = str(resolve_spec(spec))
     out["eval_source_files"] = session.source_paths or []
     logger.info(
-        "batch 检查点已补算新增指标 task_id={} | {}",
+        "Batch checkpoint metrics backfilled task_id={} | {}",
         task.task_id,
         _extended_metrics_log_fragment(out),
     )
@@ -1082,8 +1116,8 @@ def _checkpoint_resolve_task_rows(
     prev_tasks: Any,
 ) -> List[Optional[Dict[str, Any]]]:
     """
-    按用例内容指纹从检查点匹配可复用行（与列表下标、task_id 无关）。
-    返回与 loaded_tasks 等长的列表：可复用则为合并后的行，否则为 None。
+    Match reusable checkpoint rows by case-content fingerprint, independent
+    of list position and task ID. The result aligns with ``loaded_tasks``.
     """
     if not isinstance(prev_tasks, list):
         return [None] * len(loaded_tasks)
@@ -1105,7 +1139,7 @@ def _checkpoint_resolve_task_rows(
         merged = _merge_checkpoint_row_with_task(src, task)
         if src.get("task_id") != task.task_id:
             logger.info(
-                "batch 检查点按内容指纹复用评测结果，task_id {} -> {}",
+                "Reused batch result by content fingerprint, task_id {} -> {}",
                 src.get("task_id"),
                 task.task_id,
             )
@@ -1114,7 +1148,8 @@ def _checkpoint_resolve_task_rows(
 
     if reused:
         logger.info(
-            "batch 断点续跑: 按内容指纹复用 {} / {} 条（task_id 变更不影响匹配）",
+            "Batch resume reused {} / {} rows by content fingerprint; "
+            "task ID changes are ignored",
             reused,
             len(loaded_tasks),
         )
@@ -1195,7 +1230,7 @@ def run_batch(
     tasks_path = Path(tasks_path)
     loaded = load_tasks_document(tasks_path)
     logger.info(
-        "已加载评测任务条数={} (任务文件格式={})",
+        "Loaded {} evaluation tasks (format={})",
         len(loaded.tasks),
         loaded.format,
     )
@@ -1203,8 +1238,9 @@ def run_batch(
     preflight = _active_evidence_preflight(loaded.tasks, er_root)
     idx_uid = resolve_index_user_id(tasks_path)
     logger.info(
-        "证据召回配置: benchmark_data_root={} index_user_id={} "
-        "(覆盖: --benchmark-data-root / 环境 BENCHMARK_DATA_ROOT；用户: BENCHMARK_INDEX_USER_ID 或 tasks 路径推断)",
+        "Evidence recall configuration: benchmark_data_root={} index_user_id={} "
+        "(override: --benchmark-data-root or BENCHMARK_DATA_ROOT; user: "
+        "BENCHMARK_INDEX_USER_ID or tasks path inference)",
         str(er_root.resolve()) if er_root else None,
         idx_uid,
     )
@@ -1216,18 +1252,26 @@ def run_batch(
 
     default_target = resolve_spec(default_spec)
     default_session = get_session(default_spec)
-    # dry_run：不读断点、不做增量检查点写入；仍可在 persist_path 上于结束时一次性落盘。
+    default_log_content_fingerprint = log_content_fingerprint(
+        default_session.source_paths
+    )
+    # Dry runs ignore resume data and write at most one final report.
     persist_path: Optional[Path] = Path(checkpoint_path).resolve() if checkpoint_path else None
     resume_path: Optional[Path] = persist_path if (persist_path is not None and not dry_run) else None
     if dry_run and persist_path:
-        logger.info("batch dry_run：断点续跑与增量检查点关闭，全部任务结束后一次性写入 {}", persist_path)
+        logger.info(
+            "batch dry_run: resume and incremental checkpoints disabled; "
+            "final output -> {}",
+            persist_path,
+        )
     if resume_path and overwrite:
-        logger.info("batch 检查点 overwrite=true，将从头测评并覆盖 {}", resume_path)
+        logger.info("Batch checkpoint overwrite=true; restarting and replacing {}", resume_path)
     elif resume_path and not overwrite:
-        logger.info("batch 检查点路径={}（存在则按前缀续跑，除非参数不一致）", resume_path)
+        logger.info("Batch checkpoint path={} (resume when compatible)", resume_path)
 
     logger.info(
-        "batch 开始 path={} dry_run={} 默认日志={} | 默认会话: 全量交互轮次={} 业务向交互轮次={} | "
+        "Batch started path={} dry_run={} default_trace={} | session: "
+        "all_turns={} business_turns={} | "
         "evidence_recall={} tool_use_effectiveness={} answer_information_metrics={} efficiency={}",
         tasks_path,
         dry_run,
@@ -1245,6 +1289,7 @@ def run_batch(
         tasks_path=tasks_path,
         default_spec=default_spec,
         default_target=default_target,
+        log_content_fingerprint=default_log_content_fingerprint,
         dry_run=dry_run,
         with_efficiency=with_efficiency,
         with_tool_use_effectiveness=with_tool_use_effectiveness,
@@ -1266,11 +1311,16 @@ def run_batch(
                     )
                 elif isinstance(prev, dict):
                     logger.warning(
-                        "batch 检查点与当前任务文件或测评参数不一致，将从头测评并覆盖: {}",
+                        "Batch checkpoint is incompatible with current cases or "
+                        "settings; restarting: {}",
                         resume_path,
                     )
         except Exception as e:
-            logger.warning("batch 检查点读取失败，将从头测评: {} err={}", resume_path, e)
+            logger.warning(
+                "Failed to read batch checkpoint; restarting: {} err={}",
+                resume_path,
+                e,
+            )
 
     if any(r is not None for r in resolved_rows):
         resolved_rows = _checkpoint_apply_new_metrics_to_resolved(
@@ -1295,18 +1345,19 @@ def run_batch(
     reused_total = sum(row is not None for row in resolved_rows)
     if show_progress:
         _print_batch_progress(
-            f"[评测开始] 共 {task_total} 题 | 已复用 {reused_total} 题 | 待评 {task_total - reused_total} 题"
+            f"[evaluation started] total={task_total} reused={reused_total} "
+            f"pending={task_total - reused_total}"
         )
     for idx, (task, reused) in enumerate(zip(loaded.tasks, resolved_rows), start=1):
         if reused is not None:
             row = reused
         else:
             if show_progress:
-                _print_batch_progress(f"[{idx}/{task_total}] {task.task_id} 评测中...")
+                _print_batch_progress(f"[{idx}/{task_total}] {task.task_id} evaluating...")
             spec = task.session_log or default_spec
             sess = get_session(spec)
             logger.debug(
-                "batch 评测中 task_id={} session_log_spec={!r} -> {}",
+                "Batch evaluating task_id={} session_log_spec={!r} -> {}",
                 task.task_id,
                 spec,
                 resolve_spec(spec),
@@ -1341,6 +1392,7 @@ def run_batch(
                 default_spec=default_spec,
                 default_target=default_target,
                 default_session=default_session,
+                log_content_fingerprint=default_log_content_fingerprint,
                 per_task=per_task,
                 dry_run=dry_run,
                 with_efficiency=with_efficiency,
@@ -1352,7 +1404,7 @@ def run_batch(
                 with_answer_information_metrics=with_answer_information_metrics,
             )
             atomic_write_json(resume_path, out_partial)
-            logger.debug("batch 检查点已写入 {} 条任务 -> {}", len(per_task), resume_path)
+            logger.debug("Batch checkpoint wrote {} tasks -> {}", len(per_task), resume_path)
 
     out = _assemble_batch_report(
         loaded=loaded,
@@ -1360,6 +1412,7 @@ def run_batch(
         default_spec=default_spec,
         default_target=default_target,
         default_session=default_session,
+        log_content_fingerprint=default_log_content_fingerprint,
         per_task=per_task,
         dry_run=dry_run,
         with_efficiency=with_efficiency,
@@ -1377,7 +1430,7 @@ def run_batch(
 
     sm = out["summary"]
     logger.info(
-        "batch 结束 evaluated={} skipped={} mean_score={} pass_rate={}",
+        "Batch completed evaluated={} skipped={} mean_score={} pass_rate={}",
         sm.get("evaluated_count"),
         sm.get("skipped_count"),
         sm.get("mean_score"),
@@ -1389,14 +1442,15 @@ def run_batch(
         mean_score = sm.get("mean_score")
         mean_text = f"{float(mean_score):.2f}" if mean_score is not None else "-"
         _print_batch_progress(
-            f"[评测完成] 有效 {evaluated}/{task_total} 题 | 均分 {mean_text} | 通过 {passed}/{evaluated}"
+            f"[evaluation completed] evaluated={evaluated}/{task_total} "
+            f"mean={mean_text} passed={passed}/{evaluated}"
         )
     logger.info(
-        "batch 扩展指标汇总 | 证据召回 mean_recall={} (evaluated={}, no_tool_call_excluded={}) | "
-        "证据召回(含无工具调用) mean_recall_all={} (evaluated={}) | "
-        "答案信息点 mean_F1={} mean_R={} mean_P={} (evaluated={}) | "
-        "工具有效性 mean_effective_ratio={} (evaluated={}, no_tool_call_excluded={}) | "
-        "工具有效性(含无工具调用) mean_effective_ratio_all={} (evaluated={})",
+        "Batch metric summary | evidence_recall mean={} "
+        "(evaluated={}, no_tool_call_excluded={}) | evidence_recall_all mean={} "
+        "(evaluated={}) | answer_information mean_F1={} mean_R={} mean_P={} "
+        "(evaluated={}) | tool_effectiveness mean={} (evaluated={}, no_tool_call_excluded={}) | "
+        "tool_effectiveness_all mean={} (evaluated={})",
         sm.get("mean_evidence_recall"),
         sm.get("evidence_recall_evaluated_count"),
         sm.get("evidence_recall_no_tool_call_excluded_count"),
@@ -1434,26 +1488,26 @@ def run_one(
     tasks_path = Path(tasks_path)
     loaded = load_tasks_document(tasks_path)
     logger.info(
-        "已加载评测任务条数={} (任务文件格式={})",
+        "Loaded {} evaluation tasks (format={})",
         len(loaded.tasks),
         loaded.format,
     )
     er_root_1 = benchmark_data_root if benchmark_data_root is not None else resolve_benchmark_data_root()
     logger.info(
-        "证据召回配置: benchmark_data_root={} index_user_id={}",
+        "Evidence recall configuration: benchmark_data_root={} index_user_id={}",
         str(er_root_1.resolve()) if er_root_1 else None,
         resolve_index_user_id(tasks_path),
     )
     if task_id:
         task = next((t for t in loaded.tasks if t.task_id == task_id), None)
         if task is None:
-            raise ValueError(f"未找到 task_id={task_id!r}")
+            raise ValueError(f"Unknown task_id={task_id!r}")
     elif task_index is not None:
         if task_index < 0 or task_index >= len(loaded.tasks):
-            raise ValueError(f"task_index 越界: {task_index}")
+            raise ValueError(f"task_index out of range: {task_index}")
         task = loaded.tasks[task_index]
     else:
-        raise ValueError("必须指定 --task-id 或 --task-index")
+        raise ValueError("Specify --task-id or --task-index")
 
     preflight = _active_evidence_preflight([task], er_root_1)
 
@@ -1463,7 +1517,7 @@ def run_one(
     if not log_spec:
         raise ValueError("No agent trace was provided; use --log")
     logger.info(
-        "run-one 指定 task_id={!r} task_index={!r} 实际评测 task_id={} 解析日志={}",
+        "run-one requested task_id={!r} task_index={!r}; evaluating task_id={} trace={}",
         task_id,
         task_index,
         task.task_id,
@@ -1471,7 +1525,7 @@ def run_one(
     )
     session = get_session(log_spec)
     logger.info(
-        "run-one 当前会话: 全量交互轮次={} 业务向交互轮次={} session_id={}",
+        "run-one session: all_turns={} business_turns={} session_id={}",
         len(session.turns),
         len(session.business_turns()),
         session.session_id,
@@ -1629,7 +1683,7 @@ def write_report(data: Dict[str, Any], out_path: Union[str, Path]) -> None:
 
 
 def atomic_write_json(path: Path, data: Any) -> None:
-    """原子写入 JSON（同盘 replace），避免写入中断导致结果文件损坏。"""
+    """Write JSON atomically with a same-volume replacement."""
     path = path.resolve()
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_name(path.name + ".tmp")
@@ -1643,6 +1697,7 @@ def _batch_checkpoint_meta(
     tasks_path: Path,
     default_spec: str,
     default_target: Path,
+    log_content_fingerprint: str,
     dry_run: bool,
     with_efficiency: bool,
     with_tool_use_effectiveness: bool,
@@ -1672,10 +1727,11 @@ def _batch_checkpoint_meta(
         "with_answer_information_metrics": with_answer_information_metrics,
         "log_path_spec": default_spec,
         "log_path": str(Path(default_target).resolve()),
+        "log_content_fingerprint": log_content_fingerprint,
     }
 
 
-# 旧版报告 JSON 顶层可能缺失下列键；续跑时按当前 meta 的默认值对齐后再比较
+# Older reports may omit these keys; compare them using current defaults.
 _CHECKPOINT_META_DEFAULTS: Dict[str, Any] = {
     "evidence_fuzzy": False,
     "evidence_fuzzy_threshold": 0.86,
@@ -1683,7 +1739,7 @@ _CHECKPOINT_META_DEFAULTS: Dict[str, Any] = {
 
 
 def _normalize_checkpoint_benchmark_data_root(value: Any) -> Optional[str]:
-    """将 benchmark_data_root 规范为可比较的路径字符串（不做环境变量兜底）。"""
+    """Normalize benchmark_data_root for comparison without env fallback."""
     if value is None or value == "":
         return None
     try:
@@ -1723,7 +1779,12 @@ def _batch_checkpoint_compatible(prev: Dict[str, Any], meta: Dict[str, Any]) -> 
             continue
         prev_v = prev.get(k)
         if not _checkpoint_meta_value_equal(k, prev_v, v):
-            logger.debug("batch 检查点 meta 不一致 key={} prev={!r} cur={!r}", k, prev.get(k), v)
+            logger.debug(
+                "Batch checkpoint metadata differs key={} previous={!r} current={!r}",
+                k,
+                prev.get(k),
+                v,
+            )
             return False
     return True
 
@@ -1735,6 +1796,7 @@ def _assemble_batch_report(
     default_spec: str,
     default_target: Path,
     default_session: ParsedSession,
+    log_content_fingerprint: str,
     per_task: List[Dict[str, Any]],
     dry_run: bool,
     with_efficiency: bool,
@@ -1755,6 +1817,7 @@ def _assemble_batch_report(
         "log_path_spec": default_spec,
         "log_path": str(Path(default_target).resolve()),
         "log_source_files": default_session.source_paths or [],
+        "log_content_fingerprint": log_content_fingerprint,
         "dry_run": dry_run,
         "with_efficiency": with_efficiency,
         "with_tool_use_effectiveness": with_tool_use_effectiveness,

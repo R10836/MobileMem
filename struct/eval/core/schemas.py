@@ -1,8 +1,8 @@
-"""Judge 输出与评测报告结构。"""
+"""Schemas for Judge output and evaluation reports."""
 
 from __future__ import annotations
 
-from typing import Any, List, Optional
+from typing import List, Optional
 
 from pydantic import BaseModel, Field
 
@@ -35,14 +35,14 @@ class JudgeOutput(BaseModel):
 
 
 def recompute_score_from_checkpoints(out: JudgeOutput) -> float:
-    """最终得分 = 各检查点 score 之和 − 各扣分 points 之和；不设下限（可为负），不截断到 0～100。"""
+    """Return checkpoint points minus deductions, without score clamping."""
     earned = sum(c.score for c in out.checkpoints)
     deduct = sum(d.points for d in out.deductions)
     return earned - deduct
 
 
 def normalize_judge_output(out: JudgeOutput, *, pass_threshold: float) -> JudgeOutput:
-    """校正大模型输出：强制 total_score_0_100 = 总得分 − 总扣分，并据阈值重算 passed。"""
+    """Recompute the total score and pass state from normalized components."""
     ts = recompute_score_from_checkpoints(out)
     passed = ts >= pass_threshold * 100 - 1e-6
     return out.model_copy(update={"total_score_0_100": ts, "passed": passed})

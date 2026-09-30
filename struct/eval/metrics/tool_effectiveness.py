@@ -1,6 +1,7 @@
-"""工具调用有效比例：基于通用 JSONL 轨迹配对和 LLM 批量标注。
+"""Measure effective tool-call ratio from paired JSONL traces and LLM labels.
 
-可选扩展（计划 P2）：pending 分块并发、工具结果结构化摘要；当前为单次批量请求。
+Potential P2 work includes concurrent chunks and richer structured summaries;
+the current implementation sends one batched request.
 """
 
 from __future__ import annotations
@@ -20,14 +21,14 @@ from eval.metrics.tool_efficiency import _args_key, _is_error_result, _parse_too
 
 _ANNOTATOR_REF_PREFIX = "tue_"
 _FINAL_ASSISTANT_MAX = 8000
-# 工具结果送入标注 LLM 的总字符预算（结构化摘要 + 可选原文首尾）；可用环境变量调大。
+# Total annotation budget for structured summaries and optional raw excerpts.
 _DEFAULT_TOOL_RESULT_BUDGET = 2800
-# 结构化摘要里标量字符串单字段上限，避免一条 error 占满预算。
+# Per-field scalar limit prevents one error string from using the full budget.
 _DIGEST_SCALAR_STR_MAX = 400
-# 非 JSON 或摘要后仍附原文时，首部/尾部各占预算比例（其余给结构化块）。
+# Head and tail shares when including raw non-JSON or summarized content.
 _RAW_HEAD_FRAC = 0.45
 _RAW_TAIL_FRAC = 0.35
-# 优先展开的字典键（评测常见：状态、错误、列表规模）。
+# Mapping keys prioritized for status, error, and result-size summaries.
 _DIGEST_PRIORITY_KEYS = (
     "ok",
     "success",
@@ -71,7 +72,7 @@ def _truncate_str(s: str, max_len: int) -> str:
 
 
 def _digest_json_value(val: Any, *, depth: int, max_depth: int, budget: list[int]) -> str:
-    """递归生成短文本；budget 为单元素可变 int，每次追加时递减。"""
+    """Recursively append compact text while decrementing a shared budget."""
     if budget[0] <= 0:
         return "…"
     if depth > max_depth:
@@ -139,7 +140,8 @@ def _structured_digest_line(parsed: Any) -> str:
 
 def _tool_result_text_digest(raw: str, *, char_budget: int) -> str:
     """
-    长文本：尽量解析 JSON 做结构化一行摘要，再附原文首/尾窗口，避免只截前缘丢失尾部错误信息。
+    Parse long JSON content into a compact summary and retain head and tail
+    windows so errors near the end are not lost.
     """
     raw = (raw or "").strip()
     if not raw:
@@ -197,8 +199,8 @@ def _rule_prefilter_event(
     prev_call_key: str | None,
 ) -> tuple[str | None, str | None]:
     """
-    返回 (reason, None) 表示规则判无效；(None, None) 表示交 LLM。
-    reason 为规则标签，用于写入 evaluations。
+    ``(reason, None)`` means a rule marked the call ineffective;
+    ``(None, None)`` delegates the decision to the LLM.
     """
     key = f"{ev.name}\0{_args_key(ev.arguments)}"
     if prev_call_key is not None and key == prev_call_key:
@@ -245,7 +247,7 @@ def _unique_tool_call_id_to_ref(
     pending_events: list[ToolCallEvent],
     pending_refs: list[str],
 ) -> dict[str, str]:
-    """非空 tool_call_id 在 pending 中恰好出现一次时，可用作 annotator_ref 缺失时的 fallback。"""
+    """Use a unique nonempty tool_call_id when annotator_ref is missing."""
     if len(pending_events) != len(pending_refs):
         return {}
     counts: Counter[str] = Counter()
@@ -346,14 +348,23 @@ def _annotate_user_repair_suffix(expected_refs: set[str]) -> str:
 
 def compute_tool_use_effectiveness(turn: ConversationTurn, task: TaskItem) -> dict[str, Any]:
     """
-    规则短路 + LLM 标注；``T=0`` 时 ``effective_tool_ratio=1.0`` 且不请求 LLM。
+    Apply deterministic rules before LLM annotation. When ``T=0``, return an
+    effective ratio of 1.0 without calling the LLM.
     """
     events = turn.iter_tool_call_events()
     T = len(events)
     if T > 0:
-        logger.debug("工具有效性评估开始 task_id={} tool_call_events={}", task.task_id, T)
+        logger.debug(
+            "Tool-effectiveness evaluation started task_id={} tool_call_events={}",
+            task.task_id,
+            T,
+        )
     if T == 0:
-        logger.debug("工具有效性 task_id={} 无工具调用 T=0 effective_ratio=1.0", task.task_id)
+        logger.debug(
+            "Tool effectiveness task_id={} has no calls; "
+            "T=0 effective_ratio=1.0",
+            task.task_id,
+        )
         return {
             "effective_tool_ratio": 1.0,
             "tool_call_total": 0,
@@ -401,7 +412,8 @@ def compute_tool_use_effectiveness(turn: ConversationTurn, task: TaskItem) -> di
     expected_refs = set(pending_refs)
     if pending_events:
         logger.debug(
-            "工具有效性 LLM 批量标注开始 task_id={} 待标注数={} 规则已判无效={} model={}",
+            "Tool-effectiveness LLM annotation started task_id={} pending={} "
+            "rule_invalid={} model={}",
             task.task_id,
             len(pending_events),
             rule_invalid,
@@ -443,7 +455,11 @@ def compute_tool_use_effectiveness(turn: ConversationTurn, task: TaskItem) -> di
                     parsed.update(parsed_cur)
                 except Exception as e:
                     last_err = str(e)
-                    logger.warning("工具有效性 JSON 解析失败 attempt={} err={}", attempt + 1, e)
+                    logger.warning(
+                        "Tool-effectiveness JSON parsing failed attempt={} err={}",
+                        attempt + 1,
+                        e,
+                    )
                     if attempt == 0 and raw.strip():
                         try:
                             from eval.judging.client import _repair_json_text_loose
@@ -464,9 +480,12 @@ def compute_tool_use_effectiveness(turn: ConversationTurn, task: TaskItem) -> di
                     break
                 if attempt == 0:
                     last_err = f"缺少 judgment: {sorted(missing_refs)}"
-                    logger.warning("工具有效性 annotator_ref 未全覆盖: {}", last_err)
+                    logger.warning(
+                        "Tool-effectiveness annotator_ref coverage incomplete: {}",
+                        sorted(missing_refs),
+                    )
         except Exception as e:
-            logger.warning("工具有效性 LLM 标注失败: {}", e)
+            logger.warning("Tool-effectiveness LLM annotation failed: {}", e)
             err_note = f"LLM 标注失败: {e}"
             for i, ev in enumerate(events):
                 if slot[i] is not None:
@@ -494,7 +513,8 @@ def compute_tool_use_effectiveness(turn: ConversationTurn, task: TaskItem) -> di
                 "error": str(e),
             }
             logger.debug(
-                "工具有效性 LLM 标注异常结束 task_id={} ratio={} effective={}/{} err={}",
+                "Tool-effectiveness LLM annotation ended with errors "
+                "task_id={} ratio={} effective={}/{} err={}",
                 task.task_id,
                 out.get("effective_tool_ratio"),
                 out.get("tool_call_effective"),
@@ -524,13 +544,14 @@ def compute_tool_use_effectiveness(turn: ConversationTurn, task: TaskItem) -> di
 
     ordered = [s for s in slot if s is not None]
     if len(ordered) != T:
-        logger.error("工具有效性 slot 不完整: T={} got={}", T, len(ordered))
+        logger.error("Tool-effectiveness slots incomplete: T={} got={}", T, len(ordered))
 
     effective_n = sum(1 for x in ordered if x.get("effective"))
     ratio = effective_n / T if T else 1.0
 
     logger.debug(
-        "工具有效性完成 task_id={} effective_ratio={} effective={}/{} llm_judged={} rule_invalid={}",
+        "Tool-effectiveness evaluation completed task_id={} "
+        "effective_ratio={} effective={}/{} llm_judged={} rule_invalid={}",
         task.task_id,
         round(ratio, 6),
         effective_n,
