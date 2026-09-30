@@ -131,7 +131,9 @@
   border-right: 2px solid currentColor;
   border-bottom: 2px solid currentColor;
   transform: rotate(45deg);
-  transition: transform 160ms ease, margin 160ms ease;
+  transition:
+    transform 160ms ease,
+    margin 160ms ease;
 }
 
 .benchmark-title-switcher[open] .benchmark-title-chevron {
