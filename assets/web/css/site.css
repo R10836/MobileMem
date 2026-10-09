@@ -564,7 +564,8 @@ h3 {
 }
 
 .dataset-tracks-scroll {
-  width: min(980px, 100%);
+  width: fit-content;
+  max-width: min(980px, 100%);
   margin: 0 auto;
   overflow-x: auto;
   border: 1px solid var(--line);
@@ -574,8 +575,8 @@ h3 {
 }
 
 .dataset-tracks-table {
-  width: 100%;
-  min-width: 720px;
+  width: auto;
+  min-width: 640px;
   border-collapse: collapse;
   font-size: 15px;
   line-height: 1.6;
